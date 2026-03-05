@@ -64,23 +64,27 @@ fn af_xdp_supported(os: &str, capabilities: ProbeResult<&CapabilityState>) -> Pr
 
     #[cfg(target_os = "linux")]
     {
-        // Safety: direct libc socket call.
-        let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
-                return ProbeResult::Blocked {
-                    reason: format!("AF_XDP probe blocked by permissions: {err}"),
+        use caps::Capability::CAP_NET_RAW;
+
+        with_temporary_effective_caps(&[CAP_NET_RAW], || {
+            // Safety: direct libc socket call.
+            let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+                    return ProbeResult::Blocked {
+                        reason: format!("AF_XDP probe blocked by permissions: {err}"),
+                    };
+                }
+                return ProbeResult::Failed {
+                    reason: format!("AF_XDP socket creation failed: {err}"),
                 };
             }
-            return ProbeResult::Failed {
-                reason: format!("AF_XDP socket creation failed: {err}"),
-            };
-        }
 
-        // Safety: fd was just returned by socket and is valid.
-        let _owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        ProbeResult::ok(true)
+            // Safety: fd was just returned by socket and is valid.
+            let _owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            ProbeResult::ok(true)
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -89,6 +93,76 @@ fn af_xdp_supported(os: &str, capabilities: ProbeResult<&CapabilityState>) -> Pr
             reason: "AF_XDP probing is only implemented on Linux".to_string(),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn with_temporary_effective_caps<T>(
+    required: &[caps::Capability],
+    probe: impl FnOnce() -> ProbeResult<T>,
+) -> ProbeResult<T> {
+    use caps::CapSet;
+
+    let permitted = match caps::read(None, CapSet::Permitted) {
+        Ok(permitted) => permitted,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read permitted capability set: {err}"),
+            };
+        }
+    };
+
+    for cap in required {
+        if !permitted.contains(cap) {
+            return ProbeResult::Blocked {
+                reason: format!("required capability {cap:?} is not in the permitted set"),
+            };
+        }
+    }
+
+    let effective = match caps::read(None, CapSet::Effective) {
+        Ok(effective) => effective,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read effective capability set: {err}"),
+            };
+        }
+    };
+
+    let mut elevated = Vec::new();
+    for cap in required {
+        if effective.contains(cap) {
+            continue;
+        }
+        if let Err(err) = caps::raise(None, CapSet::Effective, *cap) {
+            return ProbeResult::Blocked {
+                reason: format!("failed to raise {cap:?} into effective set: {err}"),
+            };
+        }
+        elevated.push(*cap);
+    }
+
+    let mut result = probe();
+
+    for cap in elevated.into_iter().rev() {
+        if let Err(err) = caps::drop(None, CapSet::Effective, cap) {
+            result = ProbeResult::Failed {
+                reason: format!(
+                    "probe succeeded but failed to drop {cap:?} from effective set: {err}"
+                ),
+            };
+            break;
+        }
+    }
+
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_temporary_effective_caps<T>(
+    _required: &[()],
+    probe: impl FnOnce() -> ProbeResult<T>,
+) -> ProbeResult<T> {
+    probe()
 }
 
 fn probe_interfaces() -> ProbeResult<Vec<InterfaceInfo>> {
