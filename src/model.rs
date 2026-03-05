@@ -1,0 +1,59 @@
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Error,
+    Warn,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Finding {
+    pub id: &'static str,
+    pub severity: Severity,
+    pub title: &'static str,
+    pub details: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceInfo {
+    pub name: String,
+    pub has_device: bool,
+    pub is_bond: bool,
+    pub tx_queues: usize,
+    pub has_ipv4: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilityState {
+    pub cap_net_admin: bool,
+    pub cap_net_raw: bool,
+    pub cap_bpf: bool,
+    pub cap_perfmon: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostSnapshot {
+    pub os: String,
+    pub kernel_release: Option<String>,
+    pub af_xdp_supported: bool,
+    pub interfaces: Vec<InterfaceInfo>,
+    pub default_route_interface: Option<String>,
+    pub capabilities_permitted: CapabilityState,
+    pub memlock_bytes: Option<u64>,
+    pub page_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub summary: Summary,
+    pub host: HostSnapshot,
+    pub findings: Vec<Finding>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Summary {
+    pub errors: usize,
+    pub warnings: usize,
+}

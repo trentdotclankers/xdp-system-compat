@@ -1,0 +1,27 @@
+[package]
+name = "xdp-system-compat"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone XDP system compatibility diagnostics for Agave validator operators"
+readme = "README.md"
+repository = "https://github.com/your-org/xdp-system-compat"
+homepage = "https://github.com/your-org/xdp-system-compat"
+documentation = "https://github.com/your-org/xdp-system-compat"
+license = "Apache-2.0"
+keywords = ["xdp", "ebpf", "agave", "solana", "compatibility"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace]
+
+[dependencies]
+clap = { version = "4.5.31", features = ["derive"] }
+libc = "0.2.171"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
