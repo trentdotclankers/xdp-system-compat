@@ -131,17 +131,28 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
     }
 
     if let ProbeResult::Ok { value: numa } = &report.host.operator_context.numa_topology {
-        println!("  numa: {} node(s)", numa.nodes.len());
+        println!("  numa nodes:");
+        if numa.nodes.is_empty() {
+            println!("  - none");
+        } else {
+            for node in &numa.nodes {
+                let size_mb = node.mem_total_kb.map(|kb| kb / 1024);
+                match size_mb {
+                    Some(size_mb) => println!("  - {}: {}MB", node.node_id, size_mb),
+                    None => println!("  - {}: unknown", node.node_id),
+                }
+            }
+        }
         if *output_level == OutputLevel::Extended {
             for node in &numa.nodes {
                 println!(
-                    "  numa node {}: mem_total_kb={:?} mem_free_kb={:?}",
+                    "  numa node {} details: mem_total_kb={:?} mem_free_kb={:?}",
                     node.node_id, node.mem_total_kb, node.mem_free_kb
                 );
             }
         }
     } else {
-        println!("  numa: topology probe unavailable");
+        println!("  numa nodes: unavailable");
     }
 
     match &report.host.interfaces {
