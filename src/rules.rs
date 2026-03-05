@@ -1,4 +1,4 @@
-use crate::model::{Finding, HostSnapshot, InterfaceInfo, ProbeResult, Severity};
+use crate::model::{Finding, HostSnapshot, InterfaceInfo, ProbeResult, RulePass, Severity};
 
 const CAP_NET_ADMIN: &str = "CAP_NET_ADMIN";
 const CAP_NET_RAW: &str = "CAP_NET_RAW";
@@ -7,8 +7,14 @@ const CAP_PERFMON: &str = "CAP_PERFMON";
 
 const ESTIMATED_MEMLOCK_PER_QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 
-pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
+pub struct Evaluation {
+    pub findings: Vec<Finding>,
+    pub passes: Vec<RulePass>,
+}
+
+pub fn evaluate(snapshot: &HostSnapshot) -> Evaluation {
     let mut findings = Vec::new();
+    let mut passes = Vec::new();
 
     if snapshot.os != "linux" {
         findings.push(Finding {
@@ -23,7 +29,13 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                 "Use a Linux host for any configuration that enables experimental XDP retransmit."
                     .to_string(),
         });
-        return findings;
+        return Evaluation { findings, passes };
+    } else {
+        passes.push(RulePass {
+            id: "XDP001",
+            title: "Host operating system supports XDP retransmit requirements",
+            details: "Host reports linux.".to_string(),
+        });
     }
 
     match &snapshot.af_xdp_supported {
@@ -35,6 +47,13 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                     title: "AF_XDP socket support is unavailable",
                     details: "AF_XDP probe returned unsupported on this host.".to_string(),
                     remediation: "Use a kernel/NIC stack with AF_XDP support enabled; verify kernel config and driver support.".to_string(),
+                });
+            } else {
+                passes.push(RulePass {
+                    id: "XDP002",
+                    title: "AF_XDP socket probe succeeded",
+                    details: "AF_XDP socket creation is available from this runtime context."
+                        .to_string(),
                 });
             }
         }
@@ -94,7 +113,9 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
     }
 
     if let Some(interfaces) = interfaces {
-        validate_interfaces(interfaces, &mut findings);
+        validate_interfaces(interfaces, &mut findings, &mut passes);
+    } else {
+        // no pass for XDP003 if inventory is inconclusive
     }
 
     match &snapshot.default_route_interface {
@@ -109,6 +130,11 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                 remediation: "If relying on implicit XDP interface selection, configure a default route or set an explicit XDP interface at validator startup.".to_string(),
             }),
             Some(default_iface) => {
+                passes.push(RulePass {
+                    id: "XDP004",
+                    title: "Default route interface detected",
+                    details: format!("Default route interface is '{default_iface}'."),
+                });
                 if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
                     if let Some(iface) = interfaces.iter().find(|i| i.name == *default_iface) {
                         if !iface.has_device || iface.is_bond {
@@ -123,6 +149,15 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                                     if iface.is_bond { " (bond master)" } else { "" }
                                 ),
                                 remediation: "When using XDP zero-copy, select a real physical interface explicitly instead of a bond/virtual interface.".to_string(),
+                            });
+                        } else {
+                            passes.push(RulePass {
+                                id: "XDP005",
+                                title: "Default route interface is physical and non-bonded",
+                                details: format!(
+                                    "Default route interface '{}' is suitable for physical interface selection.",
+                                    iface.name
+                                ),
                             });
                         }
                     }
@@ -160,6 +195,12 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                     details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
                     remediation: "Permit CAP_NET_ADMIN and CAP_NET_RAW for the validator process before enabling XDP retransmit.".to_string(),
                 });
+            } else {
+                passes.push(RulePass {
+                    id: "XDP007",
+                    title: "Required setup capabilities are permitted",
+                    details: "CAP_NET_ADMIN and CAP_NET_RAW are in the permitted set.".to_string(),
+                });
             }
 
             if !caps.cap_bpf || !caps.cap_perfmon {
@@ -176,6 +217,12 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                     title: "Capabilities for XDP zero-copy/eBPF attachment are missing",
                     details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
                     remediation: "If planning to enable XDP zero-copy, permit CAP_BPF and CAP_PERFMON for the validator process.".to_string(),
+                });
+            } else {
+                passes.push(RulePass {
+                    id: "XDP008",
+                    title: "Zero-copy/eBPF capabilities are permitted",
+                    details: "CAP_BPF and CAP_PERFMON are in the permitted set.".to_string(),
                 });
             }
         }
@@ -207,6 +254,15 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
                     ),
                     remediation: "Increase process memlock limits (for example via systemd LimitMEMLOCK) before enabling XDP retransmit.".to_string(),
                 });
+            } else {
+                passes.push(RulePass {
+                    id: "XDP010",
+                    title: "Memlock limit meets baseline XDP estimate",
+                    details: format!(
+                        "memlock={} bytes is >= estimated minimum {} bytes.",
+                        memlock, ESTIMATED_MEMLOCK_PER_QUEUE_BYTES
+                    ),
+                });
             }
         }
         ProbeResult::Blocked { reason }
@@ -223,10 +279,14 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
         }
     }
 
-    findings
+    Evaluation { findings, passes }
 }
 
-fn validate_interfaces(interfaces: &[InterfaceInfo], findings: &mut Vec<Finding>) {
+fn validate_interfaces(
+    interfaces: &[InterfaceInfo],
+    findings: &mut Vec<Finding>,
+    passes: &mut Vec<RulePass>,
+) {
     let physical_ifaces = interfaces
         .iter()
         .filter(|iface| iface.has_device)
@@ -241,6 +301,12 @@ fn validate_interfaces(interfaces: &[InterfaceInfo], findings: &mut Vec<Finding>
             remediation:
                 "Run on a host with at least one physical NIC before enabling XDP retransmit."
                     .to_string(),
+        });
+    } else {
+        passes.push(RulePass {
+            id: "XDP003",
+            title: "Physical network interfaces detected",
+            details: format!("Detected {} physical interface(s).", physical_ifaces.len()),
         });
     }
 
@@ -293,6 +359,13 @@ fn validate_interfaces(interfaces: &[InterfaceInfo], findings: &mut Vec<Finding>
                 remediation: "Ensure at least one candidate retransmit interface has IPv4 configured, or provide explicit networking that resolves source IP correctly.".to_string(),
             });
         }
+    } else {
+        passes.push(RulePass {
+            id: "XDP009",
+            title: "At least one interface has IPv4 configured",
+            details: "IPv4 source address inference has at least one candidate interface."
+                .to_string(),
+        });
     }
 }
 
@@ -353,18 +426,23 @@ mod tests {
 
     #[test]
     fn no_findings_on_well_configured_host() {
-        let findings = evaluate(&linux_snapshot());
-        assert!(findings.is_empty(), "unexpected findings: {findings:#?}");
+        let eval = evaluate(&linux_snapshot());
+        assert!(
+            eval.findings.is_empty(),
+            "unexpected findings: {:#?}",
+            eval.findings
+        );
+        assert!(!eval.passes.is_empty(), "expected affirmative pass outputs");
     }
 
     #[test]
     fn non_linux_is_hard_error() {
         let mut snapshot = linux_snapshot();
         snapshot.os = "macos".to_string();
-        let findings = evaluate(&snapshot);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].id, "XDP001");
-        assert_eq!(findings[0].severity, Severity::Error);
+        let eval = evaluate(&snapshot);
+        assert_eq!(eval.findings.len(), 1);
+        assert_eq!(eval.findings[0].id, "XDP001");
+        assert_eq!(eval.findings[0].severity, Severity::Error);
     }
 
     #[test]
@@ -376,8 +454,8 @@ mod tests {
             cap_bpf: true,
             cap_perfmon: false,
         });
-        let findings = evaluate(&snapshot);
-        let ids = findings.iter().map(|f| f.id).collect::<Vec<_>>();
+        let eval = evaluate(&snapshot);
+        let ids = eval.findings.iter().map(|f| f.id).collect::<Vec<_>>();
         assert!(ids.contains(&"XDP007"));
         assert!(ids.contains(&"XDP008"));
     }
@@ -386,8 +464,8 @@ mod tests {
     fn low_memlock_reported() {
         let mut snapshot = linux_snapshot();
         snapshot.memlock_bytes = ProbeResult::ok(1_000_000);
-        let findings = evaluate(&snapshot);
-        assert!(findings.iter().any(|f| f.id == "XDP010"));
+        let eval = evaluate(&snapshot);
+        assert!(eval.findings.iter().any(|f| f.id == "XDP010"));
     }
 
     #[test]
@@ -396,8 +474,8 @@ mod tests {
         snapshot.af_xdp_supported = ProbeResult::Blocked {
             reason: "missing CAP_NET_RAW".to_string(),
         };
-        let findings = evaluate(&snapshot);
-        assert!(findings.iter().any(|f| f.id == "XDP012"));
-        assert!(!findings.iter().any(|f| f.id == "XDP002"));
+        let eval = evaluate(&snapshot);
+        assert!(eval.findings.iter().any(|f| f.id == "XDP012"));
+        assert!(!eval.findings.iter().any(|f| f.id == "XDP002"));
     }
 }

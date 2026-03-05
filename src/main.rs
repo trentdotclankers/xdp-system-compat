@@ -31,7 +31,9 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
     let snapshot = probe::collect_snapshot();
-    let findings = rules::evaluate(&snapshot);
+    let evaluation = rules::evaluate(&snapshot);
+    let findings = evaluation.findings;
+    let passes = evaluation.passes;
 
     let errors = findings
         .iter()
@@ -47,12 +49,14 @@ fn main() {
         summary: Summary {
             errors,
             warnings,
+            passed_checks: passes.len(),
             blocked_probes,
             failed_probes,
             unavailable_probes,
         },
         host: snapshot,
         findings,
+        passes,
     };
 
     match cli.format {
@@ -81,9 +85,10 @@ fn print_text_report(report: &Report, output_level: &OutputLevel, verbose: bool)
         println!("  kernel: {release}");
     }
     println!(
-        "  findings: {} error(s), {} warning(s); probes: {} blocked, {} failed, {} unavailable",
+        "  findings: {} error(s), {} warning(s), {} passed; probes: {} blocked, {} failed, {} unavailable",
         report.summary.errors,
         report.summary.warnings,
+        report.summary.passed_checks,
         report.summary.blocked_probes,
         report.summary.failed_probes,
         report.summary.unavailable_probes
@@ -103,6 +108,15 @@ fn print_text_report(report: &Report, output_level: &OutputLevel, verbose: bool)
             println!("  remediation: {}", f.remediation);
         }
     }
+    if report.passes.is_empty() {
+        println!("\nChecks Passed: none");
+    } else {
+        println!("\nChecks Passed:");
+        for pass in &report.passes {
+            println!("- [{}] {}", pass.id, pass.title);
+            println!("  details: {}", pass.details);
+        }
+    }
 
     print_operator_context(report, output_level, verbose);
 }
@@ -113,7 +127,10 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
 
     if let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology {
         println!("  cpu: {} logical cores online", cpu.logical_core_count);
-        println!("  cpu online indexes: {}", format_index_ranges(&cpu.online_cores));
+        println!(
+            "  cpu online indexes: {}",
+            format_index_ranges(&cpu.online_cores)
+        );
         if *output_level == OutputLevel::Extended {
             println!("  smt sibling sets: {:?}", cpu.smt_sibling_sets);
             for core in &cpu.core_to_numa {
@@ -161,7 +178,11 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
             if hidden == 0 {
                 println!("  interfaces: {} discovered", ifaces.len());
             } else {
-                println!("  interfaces: {} discovered ({} hidden)", ifaces.len(), hidden);
+                println!(
+                    "  interfaces: {} discovered ({} hidden)",
+                    ifaces.len(),
+                    hidden
+                );
             }
             for iface in &visible_ifaces {
                 let zerocopy = interface_zerocopy(report, &iface.name)
@@ -324,7 +345,8 @@ fn visible_interfaces(report: &Report, verbose: bool) -> Vec<&InterfaceInfo> {
 }
 
 fn interface_zerocopy(report: &Report, interface: &str) -> Option<String> {
-    let ProbeResult::Ok { value: statuses } = &report.host.operator_context.xdp_interface_status else {
+    let ProbeResult::Ok { value: statuses } = &report.host.operator_context.xdp_interface_status
+    else {
         return None;
     };
     statuses

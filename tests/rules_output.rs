@@ -52,6 +52,6 @@ fn default_route_missing_generates_warning() {
         page_size_bytes: 4096,
     };
 
-    let findings = evaluate(&snapshot);
-    assert!(findings.iter().any(|f| f.id == "XDP004"));
+    let evaluation = evaluate(&snapshot);
+    assert!(evaluation.findings.iter().any(|f| f.id == "XDP004"));
 }

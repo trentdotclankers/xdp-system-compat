@@ -17,6 +17,13 @@ pub struct Finding {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RulePass {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProbeResult<T> {
     Ok { value: T },
@@ -173,12 +180,14 @@ pub struct Report {
     pub summary: Summary,
     pub host: HostSnapshot,
     pub findings: Vec<Finding>,
+    pub passes: Vec<RulePass>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Summary {
     pub errors: usize,
     pub warnings: usize,
+    pub passed_checks: usize,
     pub blocked_probes: usize,
     pub failed_probes: usize,
     pub unavailable_probes: usize,
