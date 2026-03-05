@@ -6,11 +6,6 @@ use std::{
     path::Path,
 };
 
-const CAP_NET_ADMIN_BIT: u32 = 12;
-const CAP_NET_RAW_BIT: u32 = 13;
-const CAP_PERFMON_BIT: u32 = 38;
-const CAP_BPF_BIT: u32 = 39;
-
 pub fn collect_snapshot() -> HostSnapshot {
     // Phase A: always-safe probes.
     let os = std::env::consts::OS.to_string();
@@ -170,54 +165,36 @@ fn default_route_interface() -> ProbeResult<Option<String>> {
 }
 
 fn probe_capabilities() -> ProbeResult<CapabilityState> {
-    let status = match fs::read_to_string("/proc/self/status") {
-        Ok(status) => status,
-        Err(err) => {
-            return ProbeResult::Failed {
-                reason: format!("failed to read /proc/self/status: {err}"),
-            };
-        }
-    };
+    #[cfg(target_os = "linux")]
+    {
+        use caps::{
+            CapSet,
+            Capability::{CAP_BPF, CAP_NET_ADMIN, CAP_NET_RAW, CAP_PERFMON},
+        };
 
-    let mut cap_prm = None;
-    for line in status.lines() {
-        if let Some(hex) = line.strip_prefix("CapPrm:\t") {
-            match u64::from_str_radix(hex.trim(), 16) {
-                Ok(bits) => {
-                    cap_prm = Some(bits);
-                    break;
-                }
-                Err(err) => {
-                    return ProbeResult::Failed {
-                        reason: format!("failed to parse CapPrm value '{hex}': {err}"),
-                    };
-                }
+        let permitted = match caps::read(None, CapSet::Permitted) {
+            Ok(permitted) => permitted,
+            Err(err) => {
+                return ProbeResult::Failed {
+                    reason: format!("failed to read permitted capability set: {err}"),
+                };
             }
-        }
+        };
+
+        ProbeResult::ok(CapabilityState {
+            cap_net_admin: permitted.contains(&CAP_NET_ADMIN),
+            cap_net_raw: permitted.contains(&CAP_NET_RAW),
+            cap_bpf: permitted.contains(&CAP_BPF),
+            cap_perfmon: permitted.contains(&CAP_PERFMON),
+        })
     }
 
-    let cap_prm = match cap_prm {
-        Some(bits) => bits,
-        None => {
-            return ProbeResult::Unavailable {
-                reason: "CapPrm field missing in /proc/self/status".to_string(),
-            };
+    #[cfg(not(target_os = "linux"))]
+    {
+        ProbeResult::Unavailable {
+            reason: "Capability probing via caps crate is only implemented on Linux".to_string(),
         }
-    };
-
-    ProbeResult::ok(CapabilityState {
-        cap_net_admin: bit_set(cap_prm, CAP_NET_ADMIN_BIT),
-        cap_net_raw: bit_set(cap_prm, CAP_NET_RAW_BIT),
-        cap_bpf: bit_set(cap_prm, CAP_BPF_BIT),
-        cap_perfmon: bit_set(cap_prm, CAP_PERFMON_BIT),
-    })
-}
-
-fn bit_set(mask: u64, bit: u32) -> bool {
-    if bit >= 64 {
-        return false;
     }
-    (mask & (1u64 << bit)) != 0
 }
 
 fn parse_memlock_limit() -> ProbeResult<u64> {
