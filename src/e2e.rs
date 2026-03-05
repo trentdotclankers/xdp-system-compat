@@ -93,76 +93,21 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
         }
 
         let attempts = config.retries.max(1);
-        let mut last_err: Option<String> = None;
-        let mut mode_result: Option<(E2eModeResult, E2eModeResult)> = None;
+        let queue_count = iface.rx_queues.min(iface.tx_queues).max(1);
+        let copy_mode = run_mode_probe_with_retries(&iface.name, queue_count, attempts, false);
+        let zerocopy_mode = run_mode_probe_with_retries(&iface.name, queue_count, attempts, true);
+        let (status, reason) = derive_interface_status(&copy_mode, &zerocopy_mode);
 
-        for _ in 0..attempts {
-            match run_af_xdp_probe(&iface.name) {
-                Ok(probe) => {
-                    let copy = mode_pass(
-                        "AF_XDP copy-mode probe passed: socket + UMEM + rings + bind succeeded",
-                    );
-                    let zerocopy = match probe.zerocopy_error {
-                        None => mode_pass(
-                            "AF_XDP zerocopy probe passed: socket + UMEM + rings + bind succeeded",
-                        ),
-                        Some(err) => mode_fail(&format!("AF_XDP zerocopy probe failed: {err}")),
-                    };
-                    mode_result = Some((copy, zerocopy));
-                    break;
-                }
-                Err(AfXdpProbeError::Permission(err)) => {
-                    let blocked =
-                        format!("AF_XDP probe blocked by permissions/capabilities: {err}");
-                    results.push(E2eInterfaceResult {
-                        interface: iface.name.clone(),
-                        status: E2eStatus::Skip,
-                        reason: blocked.clone(),
-                        copy_mode: mode_skip(&blocked),
-                        zerocopy_mode: mode_skip(&blocked),
-                        packets_sent: 0,
-                        packets_received: 0,
-                        attempts: 0,
-                    });
-                    last_err = None;
-                    break;
-                }
-                Err(AfXdpProbeError::Incompatible(err)) => {
-                    last_err = Some(err);
-                }
-                Err(AfXdpProbeError::Transient(err)) => {
-                    last_err = Some(err);
-                }
-            }
-        }
-
-        if let Some((copy_mode, zerocopy_mode)) = mode_result {
-            results.push(E2eInterfaceResult {
-                interface: iface.name.clone(),
-                status: E2eStatus::Pass,
-                reason: copy_mode.reason.clone(),
-                copy_mode,
-                zerocopy_mode,
-                packets_sent: 0,
-                packets_received: 0,
-                attempts,
-            });
-            continue;
-        }
-
-        if let Some(reason) = last_err {
-            let failed = format!("AF_XDP probe failed: {reason}");
-            results.push(E2eInterfaceResult {
-                interface: iface.name.clone(),
-                status: E2eStatus::Fail,
-                reason: failed.clone(),
-                copy_mode: mode_fail(&failed),
-                zerocopy_mode: mode_fail(&failed),
-                packets_sent: 0,
-                packets_received: 0,
-                attempts,
-            });
-        }
+        results.push(E2eInterfaceResult {
+            interface: iface.name.clone(),
+            status,
+            reason,
+            copy_mode,
+            zerocopy_mode,
+            packets_sent: 0,
+            packets_received: 0,
+            attempts,
+        });
     }
 
     finalize(results)
@@ -197,17 +142,17 @@ fn finalize(results: Vec<E2eInterfaceResult>) -> E2eReport {
 #[derive(Debug)]
 enum AfXdpProbeError {
     Permission(String),
+    Busy(String),
     Incompatible(String),
     Transient(String),
 }
 
-#[derive(Debug)]
-struct AfXdpProbeSuccess {
-    zerocopy_error: Option<String>,
-}
-
 #[cfg(target_os = "linux")]
-fn run_af_xdp_probe(interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeError> {
+fn run_af_xdp_probe(
+    interface: &str,
+    queue_id: u32,
+    zero_copy: bool,
+) -> Result<(), AfXdpProbeError> {
     use {
         caps::{
             CapSet,
@@ -371,8 +316,7 @@ fn run_af_xdp_probe(interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeErro
         }
     }
 
-    let copy_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, false);
-    let zc_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, true).err();
+    let bind_result = bind_xdp_socket(fd.as_raw_fd(), ifindex, queue_id, zero_copy);
 
     // Safety: unmap pointer allocated above.
     unsafe {
@@ -382,14 +326,16 @@ fn run_af_xdp_probe(interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeErro
         let _ = caps::drop(None, CapSet::Effective, *cap);
     }
 
-    match copy_ok {
-        Ok(()) => Ok(AfXdpProbeSuccess {
-            zerocopy_error: zc_ok.map(|err| err.to_string()),
-        }),
+    match bind_result {
+        Ok(()) => Ok(()),
         Err(err) => {
             if is_perm(&err) {
                 Err(AfXdpProbeError::Permission(format!(
                     "AF_XDP bind denied: {err}"
+                )))
+            } else if matches!(err.raw_os_error(), Some(libc::EBUSY)) {
+                Err(AfXdpProbeError::Busy(format!(
+                    "AF_XDP bind queue {queue_id} busy: {err}"
                 )))
             } else {
                 Err(AfXdpProbeError::Incompatible(format!(
@@ -401,7 +347,12 @@ fn run_af_xdp_probe(interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeErro
 }
 
 #[cfg(target_os = "linux")]
-fn bind_xdp_socket(fd: std::os::fd::RawFd, ifindex: u32, zero_copy: bool) -> std::io::Result<()> {
+fn bind_xdp_socket(
+    fd: std::os::fd::RawFd,
+    ifindex: u32,
+    queue_id: u32,
+    zero_copy: bool,
+) -> std::io::Result<()> {
     use std::mem;
 
     let sxdp = libc::sockaddr_xdp {
@@ -413,7 +364,7 @@ fn bind_xdp_socket(fd: std::os::fd::RawFd, ifindex: u32, zero_copy: bool) -> std
                 libc::XDP_COPY
             },
         sxdp_ifindex: ifindex,
-        sxdp_queue_id: 0,
+        sxdp_queue_id: queue_id,
         sxdp_shared_umem_fd: 0,
     };
 
@@ -432,10 +383,123 @@ fn bind_xdp_socket(fd: std::os::fd::RawFd, ifindex: u32, zero_copy: bool) -> std
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_af_xdp_probe(_interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeError> {
+fn run_af_xdp_probe(
+    _interface: &str,
+    _queue_id: u32,
+    _zero_copy: bool,
+) -> Result<(), AfXdpProbeError> {
     Err(AfXdpProbeError::Transient(
         "AF_XDP probe is only supported on linux".to_string(),
     ))
+}
+
+fn run_mode_probe_with_retries(
+    interface: &str,
+    queue_count: usize,
+    attempts: u32,
+    zero_copy: bool,
+) -> E2eModeResult {
+    let mode_name = if zero_copy { "zerocopy" } else { "copy" };
+    let mut last_error: Option<String> = None;
+    let mut busy_queues = Vec::new();
+
+    for _ in 0..attempts {
+        for queue_id in 0..queue_count {
+            let queue_id_u32 = match u32::try_from(queue_id) {
+                Ok(value) => value,
+                Err(_) => {
+                    return mode_fail(&format!(
+                        "AF_XDP {mode_name} probe failed: queue index {queue_id} exceeds u32 range"
+                    ));
+                }
+            };
+            match run_af_xdp_probe(interface, queue_id_u32, zero_copy) {
+                Ok(()) => {
+                    return mode_pass(&format!(
+                        "AF_XDP {mode_name} probe passed: socket + UMEM + rings + bind succeeded on queue {queue_id_u32}"
+                    ));
+                }
+                Err(AfXdpProbeError::Permission(err)) => {
+                    return mode_skip(&format!(
+                        "AF_XDP {mode_name} probe blocked by permissions/capabilities: {err}"
+                    ));
+                }
+                Err(AfXdpProbeError::Busy(err)) => {
+                    if !busy_queues.contains(&queue_id) {
+                        busy_queues.push(queue_id);
+                    }
+                    last_error = Some(err);
+                }
+                Err(AfXdpProbeError::Incompatible(err)) | Err(AfXdpProbeError::Transient(err)) => {
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if !busy_queues.is_empty() {
+        return mode_skip(&format!(
+            "AF_XDP {mode_name} probe inconclusive due to queue contention on queues {:?}; last error: {}",
+            busy_queues,
+            last_error.unwrap_or_else(|| "resource busy".to_string())
+        ));
+    }
+
+    mode_fail(&format!(
+        "AF_XDP {mode_name} probe failed: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+fn derive_interface_status(
+    copy_mode: &E2eModeResult,
+    zerocopy_mode: &E2eModeResult,
+) -> (E2eStatus, String) {
+    match copy_mode.status {
+        E2eStatus::Pass => {
+            if zerocopy_mode.status == E2eStatus::Pass {
+                (E2eStatus::Pass, copy_mode.reason.clone())
+            } else if zerocopy_mode.status == E2eStatus::Fail {
+                (
+                    E2eStatus::Pass,
+                    format!(
+                        "{}; zerocopy unavailable: {}",
+                        copy_mode.reason, zerocopy_mode.reason
+                    ),
+                )
+            } else {
+                (
+                    E2eStatus::Pass,
+                    format!(
+                        "{}; zerocopy inconclusive: {}",
+                        copy_mode.reason, zerocopy_mode.reason
+                    ),
+                )
+            }
+        }
+        E2eStatus::Fail => (E2eStatus::Fail, copy_mode.reason.clone()),
+        E2eStatus::Skip => {
+            if zerocopy_mode.status == E2eStatus::Fail {
+                (
+                    E2eStatus::Fail,
+                    format!(
+                        "{}; zerocopy failed: {}",
+                        copy_mode.reason, zerocopy_mode.reason
+                    ),
+                )
+            } else if zerocopy_mode.status == E2eStatus::Pass {
+                (
+                    E2eStatus::Skip,
+                    format!(
+                        "{}; zerocopy passed but copy baseline is inconclusive",
+                        copy_mode.reason
+                    ),
+                )
+            } else {
+                (E2eStatus::Skip, copy_mode.reason.clone())
+            }
+        }
+    }
 }
 
 fn mode_pass(reason: &str) -> E2eModeResult {
