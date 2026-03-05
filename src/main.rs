@@ -164,10 +164,26 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
                 println!("  interfaces: {} discovered ({} hidden)", ifaces.len(), hidden);
             }
             for iface in &visible_ifaces {
+                let zerocopy = interface_zerocopy(report, &iface.name)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let driver = probe_ok_value(&iface.driver)
+                    .and_then(|d| d.as_deref())
+                    .unwrap_or("unknown");
+                let mtu = probe_ok_value(&iface.mtu)
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let speed = probe_ok_value(&iface.speed_mbps)
+                    .and_then(|s| *s)
+                    .map(|s| format!("{s}Mbps"))
+                    .unwrap_or_else(|| "unknown".to_string());
                 if *output_level == OutputLevel::Basic {
                     println!(
-                        "  - {}: rxq={} txq={} device={} bond={}",
+                        "  - {}: driver={} mtu={} speed={} zerocopy={} rxq={} txq={} device={} bond={}",
                         iface.name,
+                        driver,
+                        mtu,
+                        speed,
+                        zerocopy,
                         iface.rx_queues,
                         iface.tx_queues,
                         iface.has_device,
@@ -176,16 +192,17 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
                     continue;
                 }
                 println!(
-                    "  - {}: rxq={} txq={} device={} bond={} operstate={:?} mtu={:?} speed_mbps={:?} driver={:?} pci={:?} numa={:?}",
+                    "  - {}: driver={} mtu={} speed={} zerocopy={} rxq={} txq={} device={} bond={} operstate={:?} pci={:?} numa={:?}",
                     iface.name,
+                    driver,
+                    mtu,
+                    speed,
+                    zerocopy,
                     iface.rx_queues,
                     iface.tx_queues,
                     iface.has_device,
                     iface.is_bond,
                     probe_ok_value(&iface.operstate),
-                    probe_ok_value(&iface.mtu),
-                    probe_ok_value(&iface.speed_mbps),
-                    probe_ok_value(&iface.driver),
                     probe_ok_value(&iface.pci_address),
                     probe_ok_value(&iface.numa_node),
                 );
@@ -304,6 +321,16 @@ fn visible_interfaces(report: &Report, verbose: bool) -> Vec<&InterfaceInfo> {
         | ProbeResult::Failed { .. }
         | ProbeResult::Unavailable { .. } => Vec::new(),
     }
+}
+
+fn interface_zerocopy(report: &Report, interface: &str) -> Option<String> {
+    let ProbeResult::Ok { value: statuses } = &report.host.operator_context.xdp_interface_status else {
+        return None;
+    };
+    statuses
+        .iter()
+        .find(|s| s.interface == interface)
+        .map(|s| format!("{:?}", s.zerocopy_feasibility).to_lowercase())
 }
 
 fn probe_ok_value<T>(probe: &ProbeResult<T>) -> Option<&T> {
