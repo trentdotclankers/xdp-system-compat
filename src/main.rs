@@ -1,6 +1,6 @@
 use clap::Parser;
 use xdp_system_compat::{
-    model::{HostSnapshot, ProbeResult, Report, Severity, Summary},
+    model::{HostSnapshot, InterfaceInfo, ProbeResult, Report, Severity, Summary},
     probe, rules,
 };
 
@@ -24,6 +24,8 @@ struct Cli {
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t = OutputLevel::Basic)]
     output_level: OutputLevel,
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
 }
 
 fn main() {
@@ -61,7 +63,7 @@ fn main() {
                 std::process::exit(3);
             }
         },
-        OutputFormat::Text => print_text_report(&report, &cli.output_level),
+        OutputFormat::Text => print_text_report(&report, &cli.output_level, cli.verbose),
     }
 
     if report.summary.errors > 0 {
@@ -72,7 +74,7 @@ fn main() {
     }
 }
 
-fn print_text_report(report: &Report, output_level: &OutputLevel) {
+fn print_text_report(report: &Report, output_level: &OutputLevel, verbose: bool) {
     println!("xdp-system-compat");
     println!("  os: {}", report.host.os);
     if let Some(release) = &report.host.kernel_release {
@@ -102,11 +104,12 @@ fn print_text_report(report: &Report, output_level: &OutputLevel) {
         }
     }
 
-    print_operator_context(report, output_level);
+    print_operator_context(report, output_level, verbose);
 }
 
-fn print_operator_context(report: &Report, output_level: &OutputLevel) {
+fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: bool) {
     println!("\nOperator Context:");
+    let visible_ifaces = visible_interfaces(report, verbose);
 
     if let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology {
         println!("  cpu: {} logical cores online", cpu.logical_core_count);
@@ -143,8 +146,12 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
 
     match &report.host.interfaces {
         ProbeResult::Ok { value: ifaces } => {
-            println!("  interfaces: {} discovered", ifaces.len());
-            for iface in ifaces {
+            println!(
+                "  interfaces: {} shown ({} discovered)",
+                visible_ifaces.len(),
+                ifaces.len()
+            );
+            for iface in &visible_ifaces {
                 if *output_level == OutputLevel::Basic {
                     println!(
                         "  - {}: rxq={} txq={} device={} bond={}",
@@ -176,10 +183,17 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
     }
 
     if let ProbeResult::Ok { value: iface_irqs } = &report.host.operator_context.irq_topology {
-        let total_irqs: usize = iface_irqs.iter().map(|iface| iface.irqs.len()).sum();
+        let total_irqs: usize = iface_irqs
+            .iter()
+            .filter(|iface| visible_ifaces.iter().any(|v| v.name == iface.interface))
+            .map(|iface| iface.irqs.len())
+            .sum();
         println!("  irqs: {} mapped", total_irqs);
         if *output_level == OutputLevel::Extended {
             for iface in iface_irqs {
+                if !visible_ifaces.iter().any(|v| v.name == iface.interface) {
+                    continue;
+                }
                 println!("  irq map for {}:", iface.interface);
                 for irq in &iface.irqs {
                     println!(
@@ -195,9 +209,20 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
     }
 
     if let ProbeResult::Ok { value: queue_maps } = &report.host.operator_context.queue_cpu_masks {
-        println!("  queue cpu masks: {} interface entries", queue_maps.len());
+        let shown = queue_maps
+            .iter()
+            .filter(|iface| visible_ifaces.iter().any(|v| v.name == iface.interface))
+            .count();
+        println!(
+            "  queue cpu masks: {} shown ({} interface entries)",
+            shown,
+            queue_maps.len()
+        );
         if *output_level == OutputLevel::Extended {
             for iface in queue_maps {
+                if !visible_ifaces.iter().any(|v| v.name == iface.interface) {
+                    continue;
+                }
                 println!("  queue masks for {}:", iface.interface);
                 for queue in &iface.queues {
                     println!(
@@ -217,12 +242,20 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
         value: xdp_statuses,
     } = &report.host.operator_context.xdp_interface_status
     {
+        let shown = xdp_statuses
+            .iter()
+            .filter(|status| visible_ifaces.iter().any(|v| v.name == status.interface))
+            .count();
         println!(
-            "  xdp interface status: {} interface entries",
+            "  xdp interface status: {} shown ({} interface entries)",
+            shown,
             xdp_statuses.len()
         );
         if *output_level == OutputLevel::Extended {
             for status in xdp_statuses {
+                if !visible_ifaces.iter().any(|v| v.name == status.interface) {
+                    continue;
+                }
                 println!(
                     "  xdp {}: mode={:?} prog_id={:?} zerocopy={:?} evidence={}",
                     status.interface,
@@ -246,6 +279,18 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
         );
     } else {
         println!("  bpf environment: probe unavailable");
+    }
+}
+
+fn visible_interfaces(report: &Report, verbose: bool) -> Vec<&InterfaceInfo> {
+    match &report.host.interfaces {
+        ProbeResult::Ok { value: ifaces } => ifaces
+            .iter()
+            .filter(|iface| verbose || iface.has_device)
+            .collect(),
+        ProbeResult::Blocked { .. }
+        | ProbeResult::Failed { .. }
+        | ProbeResult::Unavailable { .. } => Vec::new(),
     }
 }
 
