@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use clap::{Parser, Subcommand};
 use xdp_system_compat::{
     e2e::{self, E2eConfig},
@@ -269,10 +271,6 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
 
     if let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology {
         println!("  cpu: {} logical cores online", cpu.logical_core_count);
-        println!(
-            "  cpu online indexes: {}",
-            format_index_ranges(&cpu.online_cores)
-        );
         if *output_level == OutputLevel::Extended {
             println!("  smt sibling sets: {:?}", cpu.smt_sibling_sets);
             for core in &cpu.core_to_numa {
@@ -296,10 +294,13 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
         } else {
             for node in &numa.nodes {
                 let size_mb = node.mem_total_kb.map(|kb| kb / 1024);
-                match size_mb {
-                    Some(size_mb) => println!("  - {}: {}MB", node.node_id, size_mb),
-                    None => println!("  - {}: unknown", node.node_id),
-                }
+                let cpu_ranges = cpu_online_by_numa(report, node.node_id)
+                    .map(|cores| format_index_ranges(&cores))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let size = size_mb
+                    .map(|mb| format!("{mb}MB"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!("  - {}: size={} cpus={}", node.node_id, size, cpu_ranges);
             }
         }
         if *output_level == OutputLevel::Extended {
@@ -472,6 +473,28 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
     } else {
         println!("  bpf environment: probe unavailable");
     }
+}
+
+fn cpu_online_by_numa(report: &Report, node_id: usize) -> Option<Vec<usize>> {
+    let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology else {
+        return None;
+    };
+
+    let online: BTreeSet<usize> = cpu.online_cores.iter().copied().collect();
+    let mut cores = cpu
+        .core_to_numa
+        .iter()
+        .filter_map(|core| {
+            if core.numa_node == Some(node_id) && online.contains(&core.core_id) {
+                Some(core.core_id)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    cores.sort_unstable();
+    cores.dedup();
+    Some(cores)
 }
 
 fn visible_interfaces(report: &Report, verbose: bool) -> Vec<&InterfaceInfo> {
