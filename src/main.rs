@@ -239,10 +239,10 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
 
     if let ProbeResult::Ok { value: env } = &report.host.operator_context.bpf_environment {
         println!(
-            "  bpf environment: bpffs_mounted={:?} hugepages_total={:?} hugepages_free={:?}",
-            probe_ok_value(&env.bpffs_mounted),
-            probe_ok_value(&env.hugepages_total),
-            probe_ok_value(&env.hugepages_free),
+            "  bpf environment: {}; {}; {}",
+            format_bpffs_mountpoint(&env.bpffs_mounted),
+            format_hugepages_value("configured huge pages", &env.hugepages_total),
+            format_hugepages_value("free huge pages", &env.hugepages_free),
         );
     } else {
         println!("  bpf environment: probe unavailable");
@@ -255,6 +255,27 @@ fn probe_ok_value<T>(probe: &ProbeResult<T>) -> Option<&T> {
         ProbeResult::Blocked { .. }
         | ProbeResult::Failed { .. }
         | ProbeResult::Unavailable { .. } => None,
+    }
+}
+
+fn format_bpffs_mountpoint(bpffs_mounted: &ProbeResult<bool>) -> String {
+    match bpffs_mounted {
+        ProbeResult::Ok { value: true } => "bpffs mountpoint: /sys/fs/bpf".to_string(),
+        ProbeResult::Ok { value: false } => "bpffs mountpoint: unmounted".to_string(),
+        ProbeResult::Blocked { .. }
+        | ProbeResult::Failed { .. }
+        | ProbeResult::Unavailable { .. } => "bpffs mountpoint: unknown".to_string(),
+    }
+}
+
+fn format_hugepages_value(label: &str, value: &ProbeResult<u64>) -> String {
+    match value {
+        ProbeResult::Ok { value } => format!("{label}: {value}"),
+        ProbeResult::Blocked { .. }
+        | ProbeResult::Failed { .. }
+        | ProbeResult::Unavailable { .. } => {
+            format!("{label}: unknown")
+        }
     }
 }
 
