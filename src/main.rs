@@ -174,6 +174,44 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
         }
         _ => println!("  interfaces: inventory probe unavailable"),
     }
+
+    if let ProbeResult::Ok { value: iface_irqs } = &report.host.operator_context.irq_topology {
+        let total_irqs: usize = iface_irqs.iter().map(|iface| iface.irqs.len()).sum();
+        println!("  irqs: {} mapped", total_irqs);
+        if *output_level == OutputLevel::Extended {
+            for iface in iface_irqs {
+                println!("  irq map for {}:", iface.interface);
+                for irq in &iface.irqs {
+                    println!(
+                        "    irq {} -> affinity {:?}",
+                        irq.irq,
+                        probe_ok_value(&irq.smp_affinity_list)
+                    );
+                }
+            }
+        }
+    } else {
+        println!("  irqs: topology probe unavailable");
+    }
+
+    if let ProbeResult::Ok { value: queue_maps } = &report.host.operator_context.queue_cpu_masks {
+        println!("  queue cpu masks: {} interface entries", queue_maps.len());
+        if *output_level == OutputLevel::Extended {
+            for iface in queue_maps {
+                println!("  queue masks for {}:", iface.interface);
+                for queue in &iface.queues {
+                    println!(
+                        "    {} rps={:?} xps={:?}",
+                        queue.queue,
+                        probe_ok_value(&queue.rps_cpus),
+                        probe_ok_value(&queue.xps_cpus)
+                    );
+                }
+            }
+        }
+    } else {
+        println!("  queue cpu masks: probe unavailable");
+    }
 }
 
 fn probe_ok_value<T>(probe: &ProbeResult<T>) -> Option<&T> {
@@ -232,6 +270,18 @@ fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
         &mut failed,
         &mut unavailable,
     );
+    accumulate_probe_state(
+        &snapshot.operator_context.irq_topology,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.operator_context.queue_cpu_masks,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
 
     if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
         for iface in interfaces {
@@ -262,6 +312,37 @@ fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
                 &mut failed,
                 &mut unavailable,
             );
+        }
+    }
+
+    if let ProbeResult::Ok { value: iface_irqs } = &snapshot.operator_context.irq_topology {
+        for iface in iface_irqs {
+            for irq in &iface.irqs {
+                accumulate_probe_state(
+                    &irq.smp_affinity_list,
+                    &mut blocked,
+                    &mut failed,
+                    &mut unavailable,
+                );
+            }
+        }
+    }
+    if let ProbeResult::Ok { value: queue_maps } = &snapshot.operator_context.queue_cpu_masks {
+        for iface in queue_maps {
+            for queue in &iface.queues {
+                accumulate_probe_state(
+                    &queue.rps_cpus,
+                    &mut blocked,
+                    &mut failed,
+                    &mut unavailable,
+                );
+                accumulate_probe_state(
+                    &queue.xps_cpus,
+                    &mut blocked,
+                    &mut failed,
+                    &mut unavailable,
+                );
+            }
         }
     }
 

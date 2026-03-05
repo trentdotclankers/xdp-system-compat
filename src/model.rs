@@ -92,6 +92,33 @@ pub struct NumaTopologyInfo {
 pub struct OperatorContext {
     pub cpu_topology: ProbeResult<CpuTopologyInfo>,
     pub numa_topology: ProbeResult<NumaTopologyInfo>,
+    pub irq_topology: ProbeResult<Vec<InterfaceIrqInfo>>,
+    pub queue_cpu_masks: ProbeResult<Vec<InterfaceQueueAffinity>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IrqInfo {
+    pub irq: u32,
+    pub smp_affinity_list: ProbeResult<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceIrqInfo {
+    pub interface: String,
+    pub irqs: Vec<IrqInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueCpuMaskInfo {
+    pub queue: String,
+    pub rps_cpus: ProbeResult<String>,
+    pub xps_cpus: ProbeResult<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InterfaceQueueAffinity {
+    pub interface: String,
+    pub queues: Vec<QueueCpuMaskInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]

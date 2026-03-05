@@ -1,6 +1,7 @@
 use crate::model::{
-    CapabilityState, CpuCoreInfo, CpuTopologyInfo, HostSnapshot, InterfaceInfo, NumaNodeInfo,
-    NumaTopologyInfo, OperatorContext, ProbeResult,
+    CapabilityState, CpuCoreInfo, CpuTopologyInfo, HostSnapshot, InterfaceInfo, InterfaceIrqInfo,
+    InterfaceQueueAffinity, IrqInfo, NumaNodeInfo, NumaTopologyInfo, OperatorContext, ProbeResult,
+    QueueCpuMaskInfo,
 };
 use std::{
     ffi::CString,
@@ -23,6 +24,8 @@ pub fn collect_snapshot() -> HostSnapshot {
     let numa_topology = probe_numa_topology();
     let mut interfaces = probe_interfaces();
     let default_route_interface = default_route_interface();
+    let irq_topology = probe_irq_topology(&interfaces);
+    let queue_cpu_masks = probe_queue_cpu_masks(&interfaces);
 
     // Phase B: capability context.
     let capabilities_permitted = probe_capabilities();
@@ -39,6 +42,8 @@ pub fn collect_snapshot() -> HostSnapshot {
         operator_context: OperatorContext {
             cpu_topology,
             numa_topology,
+            irq_topology,
+            queue_cpu_masks,
         },
         default_route_interface,
         capabilities_permitted,
@@ -267,6 +272,170 @@ fn default_route_interface() -> ProbeResult<Option<String>> {
         }
     }
     ProbeResult::ok(None)
+}
+
+fn probe_irq_topology(
+    interfaces: &ProbeResult<Vec<InterfaceInfo>>,
+) -> ProbeResult<Vec<InterfaceIrqInfo>> {
+    let interfaces = match interfaces {
+        ProbeResult::Ok { value } => value,
+        ProbeResult::Blocked { reason } => {
+            return ProbeResult::Blocked {
+                reason: format!("interface inventory blocked: {reason}"),
+            };
+        }
+        ProbeResult::Failed { reason } => {
+            return ProbeResult::Failed {
+                reason: format!("interface inventory failed: {reason}"),
+            };
+        }
+        ProbeResult::Unavailable { reason } => {
+            return ProbeResult::Unavailable {
+                reason: format!("interface inventory unavailable: {reason}"),
+            };
+        }
+    };
+
+    let mut by_iface = Vec::new();
+    for iface in interfaces {
+        let mut irqs = probe_irqs_for_interface(&iface.name);
+        irqs.sort_by_key(|i| i.irq);
+        by_iface.push(InterfaceIrqInfo {
+            interface: iface.name.clone(),
+            irqs,
+        });
+    }
+    ProbeResult::ok(by_iface)
+}
+
+fn probe_irqs_for_interface(interface: &str) -> Vec<IrqInfo> {
+    let mut irq_ids = Vec::<u32>::new();
+
+    let msi_dir = Path::new("/sys/class/net")
+        .join(interface)
+        .join("device/msi_irqs");
+    if let Ok(entries) = fs::read_dir(msi_dir) {
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(irq) = name.parse::<u32>() {
+                    irq_ids.push(irq);
+                }
+            }
+        }
+    }
+
+    if irq_ids.is_empty() {
+        if let Ok(interrupts) = fs::read_to_string("/proc/interrupts") {
+            for line in interrupts.lines() {
+                if !line.contains(interface) {
+                    continue;
+                }
+                if let Some((irq_field, _)) = line.split_once(':') {
+                    if let Ok(irq) = irq_field.trim().parse::<u32>() {
+                        irq_ids.push(irq);
+                    }
+                }
+            }
+        }
+    }
+
+    irq_ids.sort_unstable();
+    irq_ids.dedup();
+
+    irq_ids
+        .into_iter()
+        .map(|irq| IrqInfo {
+            irq,
+            smp_affinity_list: read_string_probe(Path::new(&format!(
+                "/proc/irq/{irq}/smp_affinity_list"
+            ))),
+        })
+        .collect()
+}
+
+fn probe_queue_cpu_masks(
+    interfaces: &ProbeResult<Vec<InterfaceInfo>>,
+) -> ProbeResult<Vec<InterfaceQueueAffinity>> {
+    let interfaces = match interfaces {
+        ProbeResult::Ok { value } => value,
+        ProbeResult::Blocked { reason } => {
+            return ProbeResult::Blocked {
+                reason: format!("interface inventory blocked: {reason}"),
+            };
+        }
+        ProbeResult::Failed { reason } => {
+            return ProbeResult::Failed {
+                reason: format!("interface inventory failed: {reason}"),
+            };
+        }
+        ProbeResult::Unavailable { reason } => {
+            return ProbeResult::Unavailable {
+                reason: format!("interface inventory unavailable: {reason}"),
+            };
+        }
+    };
+
+    let mut mappings = Vec::new();
+    for iface in interfaces {
+        let queues_dir = Path::new("/sys/class/net").join(&iface.name).join("queues");
+        let entries = match fs::read_dir(&queues_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                mappings.push(InterfaceQueueAffinity {
+                    interface: iface.name.clone(),
+                    queues: vec![QueueCpuMaskInfo {
+                        queue: "<queues_unavailable>".to_string(),
+                        rps_cpus: ProbeResult::Failed {
+                            reason: format!("failed to read queues directory: {err}"),
+                        },
+                        xps_cpus: ProbeResult::Failed {
+                            reason: format!("failed to read queues directory: {err}"),
+                        },
+                    }],
+                });
+                continue;
+            }
+        };
+
+        let mut queue_masks = Vec::new();
+        for entry in entries.flatten() {
+            let queue = entry.file_name().to_string_lossy().to_string();
+            let qpath = entry.path();
+            queue_masks.push(QueueCpuMaskInfo {
+                queue,
+                rps_cpus: read_string_probe(&qpath.join("rps_cpus")),
+                xps_cpus: read_string_probe(&qpath.join("xps_cpus")),
+            });
+        }
+        queue_masks.sort_by(|a, b| a.queue.cmp(&b.queue));
+        mappings.push(InterfaceQueueAffinity {
+            interface: iface.name.clone(),
+            queues: queue_masks,
+        });
+    }
+
+    ProbeResult::ok(mappings)
+}
+
+fn read_string_probe(path: &Path) -> ProbeResult<String> {
+    match fs::read_to_string(path) {
+        Ok(v) => ProbeResult::ok(v.trim().to_string()),
+        Err(err) => {
+            if err.kind() == io::ErrorKind::NotFound {
+                ProbeResult::Unavailable {
+                    reason: format!("{} not present", path.display()),
+                }
+            } else if err.kind() == io::ErrorKind::PermissionDenied {
+                ProbeResult::Blocked {
+                    reason: format!("permission denied for {}", path.display()),
+                }
+            } else {
+                ProbeResult::Failed {
+                    reason: format!("failed to read {}: {err}", path.display()),
+                }
+            }
+        }
+    }
 }
 
 fn probe_cpu_topology() -> ProbeResult<CpuTopologyInfo> {

@@ -332,6 +332,8 @@ mod tests {
                     smt_sibling_sets: vec![],
                 }),
                 numa_topology: ProbeResult::ok(NumaTopologyInfo { nodes: vec![] }),
+                irq_topology: ProbeResult::ok(vec![]),
+                queue_cpu_masks: ProbeResult::ok(vec![]),
             },
             default_route_interface: ProbeResult::ok(Some("eth0".to_string())),
             capabilities_permitted: ProbeResult::ok(CapabilityState {

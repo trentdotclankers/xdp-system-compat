@@ -34,6 +34,8 @@ fn default_route_missing_generates_warning() {
                 smt_sibling_sets: vec![],
             }),
             numa_topology: ProbeResult::ok(NumaTopologyInfo { nodes: vec![] }),
+            irq_topology: ProbeResult::ok(vec![]),
+            queue_cpu_masks: ProbeResult::ok(vec![]),
         },
         default_route_interface: ProbeResult::ok(None),
         capabilities_permitted: ProbeResult::ok(CapabilityState {
