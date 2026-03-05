@@ -1,5 +1,5 @@
 use crate::model::{
-    E2eInterfaceResult, E2eReport, E2eStatus, E2eSummary, HostSnapshot, ProbeResult,
+    E2eInterfaceResult, E2eModeResult, E2eReport, E2eStatus, E2eSummary, HostSnapshot, ProbeResult,
 };
 
 #[derive(Debug, Clone)]
@@ -19,6 +19,8 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             interface: "<all>".to_string(),
             status: E2eStatus::Skip,
             reason: "AF_XDP probe is only supported on linux".to_string(),
+            copy_mode: mode_skip("AF_XDP probe is only supported on linux"),
+            zerocopy_mode: mode_skip("AF_XDP probe is only supported on linux"),
             packets_sent: 0,
             packets_received: 0,
             attempts: 0,
@@ -37,6 +39,12 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
                 reason: format!(
                     "AF_XDP probe could not run: interface inventory unavailable: {reason}"
                 ),
+                copy_mode: mode_skip(&format!(
+                    "AF_XDP probe could not run: interface inventory unavailable: {reason}"
+                )),
+                zerocopy_mode: mode_skip(&format!(
+                    "AF_XDP probe could not run: interface inventory unavailable: {reason}"
+                )),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -61,6 +69,8 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
                 interface: iface.name.clone(),
                 status: E2eStatus::Skip,
                 reason: "AF_XDP probe skipped: interface is not up".to_string(),
+                copy_mode: mode_skip("AF_XDP probe skipped: interface is not up"),
+                zerocopy_mode: mode_skip("AF_XDP probe skipped: interface is not up"),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -73,6 +83,8 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
                 interface: iface.name.clone(),
                 status: E2eStatus::Skip,
                 reason: "AF_XDP probe skipped: interface has no rx/tx queues".to_string(),
+                copy_mode: mode_skip("AF_XDP probe skipped: interface has no rx/tx queues"),
+                zerocopy_mode: mode_skip("AF_XDP probe skipped: interface has no rx/tx queues"),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -82,29 +94,36 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
 
         let attempts = config.retries.max(1);
         let mut last_err: Option<String> = None;
-        let mut pass_reason = None;
+        let mut mode_result: Option<(E2eModeResult, E2eModeResult)> = None;
 
         for _ in 0..attempts {
             match run_af_xdp_probe(&iface.name) {
-                Ok(zero_copy_supported) => {
-                    pass_reason = Some(if zero_copy_supported {
-                        "AF_XDP probe passed: socket + UMEM + rings + bind succeeded (zerocopy supported)"
-                            .to_string()
-                    } else {
-                        "AF_XDP probe passed: socket + UMEM + rings + bind succeeded (copy mode only)".to_string()
-                    });
+                Ok(probe) => {
+                    let copy = mode_pass(
+                        "AF_XDP copy-mode probe passed: socket + UMEM + rings + bind succeeded",
+                    );
+                    let zerocopy = match probe.zerocopy_error {
+                        None => mode_pass(
+                            "AF_XDP zerocopy probe passed: socket + UMEM + rings + bind succeeded",
+                        ),
+                        Some(err) => mode_fail(&format!("AF_XDP zerocopy probe failed: {err}")),
+                    };
+                    mode_result = Some((copy, zerocopy));
                     break;
                 }
                 Err(AfXdpProbeError::Permission(err)) => {
+                    let blocked =
+                        format!("AF_XDP probe blocked by permissions/capabilities: {err}");
                     results.push(E2eInterfaceResult {
                         interface: iface.name.clone(),
                         status: E2eStatus::Skip,
-                        reason: format!("AF_XDP probe blocked by permissions/capabilities: {err}"),
+                        reason: blocked.clone(),
+                        copy_mode: mode_skip(&blocked),
+                        zerocopy_mode: mode_skip(&blocked),
                         packets_sent: 0,
                         packets_received: 0,
                         attempts: 0,
                     });
-                    pass_reason = None;
                     last_err = None;
                     break;
                 }
@@ -117,11 +136,13 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             }
         }
 
-        if let Some(reason) = pass_reason {
+        if let Some((copy_mode, zerocopy_mode)) = mode_result {
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Pass,
-                reason,
+                reason: copy_mode.reason.clone(),
+                copy_mode,
+                zerocopy_mode,
                 packets_sent: 0,
                 packets_received: 0,
                 attempts,
@@ -130,10 +151,13 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
         }
 
         if let Some(reason) = last_err {
+            let failed = format!("AF_XDP probe failed: {reason}");
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Fail,
-                reason: format!("AF_XDP probe failed: {reason}"),
+                reason: failed.clone(),
+                copy_mode: mode_fail(&failed),
+                zerocopy_mode: mode_fail(&failed),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts,
@@ -177,8 +201,13 @@ enum AfXdpProbeError {
     Transient(String),
 }
 
+#[derive(Debug)]
+struct AfXdpProbeSuccess {
+    zerocopy_error: Option<String>,
+}
+
 #[cfg(target_os = "linux")]
-fn run_af_xdp_probe(interface: &str) -> Result<bool, AfXdpProbeError> {
+fn run_af_xdp_probe(interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeError> {
     use {
         caps::{
             CapSet,
@@ -343,7 +372,7 @@ fn run_af_xdp_probe(interface: &str) -> Result<bool, AfXdpProbeError> {
     }
 
     let copy_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, false);
-    let zc_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, true);
+    let zc_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, true).err();
 
     // Safety: unmap pointer allocated above.
     unsafe {
@@ -354,7 +383,9 @@ fn run_af_xdp_probe(interface: &str) -> Result<bool, AfXdpProbeError> {
     }
 
     match copy_ok {
-        Ok(()) => Ok(zc_ok.is_ok()),
+        Ok(()) => Ok(AfXdpProbeSuccess {
+            zerocopy_error: zc_ok.map(|err| err.to_string()),
+        }),
         Err(err) => {
             if is_perm(&err) {
                 Err(AfXdpProbeError::Permission(format!(
@@ -401,8 +432,29 @@ fn bind_xdp_socket(fd: std::os::fd::RawFd, ifindex: u32, zero_copy: bool) -> std
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_af_xdp_probe(_interface: &str) -> Result<bool, AfXdpProbeError> {
+fn run_af_xdp_probe(_interface: &str) -> Result<AfXdpProbeSuccess, AfXdpProbeError> {
     Err(AfXdpProbeError::Transient(
         "AF_XDP probe is only supported on linux".to_string(),
     ))
+}
+
+fn mode_pass(reason: &str) -> E2eModeResult {
+    E2eModeResult {
+        status: E2eStatus::Pass,
+        reason: reason.to_string(),
+    }
+}
+
+fn mode_fail(reason: &str) -> E2eModeResult {
+    E2eModeResult {
+        status: E2eStatus::Fail,
+        reason: reason.to_string(),
+    }
+}
+
+fn mode_skip(reason: &str) -> E2eModeResult {
+    E2eModeResult {
+        status: E2eStatus::Skip,
+        reason: reason.to_string(),
+    }
 }

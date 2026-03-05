@@ -199,6 +199,24 @@ fn print_e2e_text_report(report: &E2eReport, verbose: bool) {
             result.interface, status, result.attempts, result.packets_sent, result.packets_received
         );
         println!("  reason: {}", result.reason);
+        println!(
+            "  copy mode: {} ({})",
+            e2e_status_label(&result.copy_mode.status),
+            result.copy_mode.reason
+        );
+        println!(
+            "  zerocopy mode: {} ({})",
+            e2e_status_label(&result.zerocopy_mode.status),
+            result.zerocopy_mode.reason
+        );
+    }
+}
+
+fn e2e_status_label(status: &E2eStatus) -> &'static str {
+    match status {
+        E2eStatus::Pass => "PASS",
+        E2eStatus::Fail => "FAIL",
+        E2eStatus::Skip => "SKIP",
     }
 }
 

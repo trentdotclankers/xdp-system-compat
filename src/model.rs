@@ -206,9 +206,17 @@ pub struct E2eInterfaceResult {
     pub interface: String,
     pub status: E2eStatus,
     pub reason: String,
+    pub copy_mode: E2eModeResult,
+    pub zerocopy_mode: E2eModeResult,
     pub packets_sent: u64,
     pub packets_received: u64,
     pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct E2eModeResult {
+    pub status: E2eStatus,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
