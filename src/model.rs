@@ -192,3 +192,35 @@ pub struct Summary {
     pub failed_probes: usize,
     pub unavailable_probes: usize,
 }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum E2eStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct E2eInterfaceResult {
+    pub interface: String,
+    pub status: E2eStatus,
+    pub reason: String,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct E2eSummary {
+    pub tested: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct E2eReport {
+    pub summary: E2eSummary,
+    pub results: Vec<E2eInterfaceResult>,
+}

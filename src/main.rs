@@ -1,6 +1,9 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use xdp_system_compat::{
-    model::{HostSnapshot, InterfaceInfo, ProbeResult, Report, Severity, Summary},
+    e2e::{self, E2eConfig},
+    model::{
+        E2eReport, E2eStatus, HostSnapshot, InterfaceInfo, ProbeResult, Report, Severity, Summary,
+    },
     probe, rules,
 };
 
@@ -16,10 +19,8 @@ enum OutputLevel {
     Extended,
 }
 
-#[derive(Debug, Parser)]
-#[command(name = "xdp-system-compat")]
-#[command(about = "Probe host compatibility constraints for Agave XDP retransmit")]
-struct Cli {
+#[derive(Debug, Clone, Parser)]
+struct ProbeArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t = OutputLevel::Basic)]
@@ -28,8 +29,58 @@ struct Cli {
     verbose: bool,
 }
 
+impl Default for ProbeArgs {
+    fn default() -> Self {
+        Self {
+            format: OutputFormat::Text,
+            output_level: OutputLevel::Basic,
+            verbose: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Parser)]
+struct E2eArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+    #[arg(long, default_value_t = false)]
+    include_non_physical: bool,
+    #[arg(long)]
+    interfaces: Option<String>,
+    #[arg(long, default_value_t = 500)]
+    timeout_ms: u64,
+    #[arg(long, default_value_t = 3)]
+    retries: u32,
+    #[arg(long, default_value_t = 39000)]
+    port_base: u16,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    E2e(E2eArgs),
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "xdp-system-compat")]
+#[command(about = "Probe host compatibility constraints for Agave XDP retransmit")]
+struct Cli {
+    #[command(flatten)]
+    probe: ProbeArgs,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
 fn main() {
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::E2e(args)) => run_e2e(args),
+        None => run_probe(cli.probe),
+    }
+}
+
+fn run_probe(args: ProbeArgs) {
     let snapshot = probe::collect_snapshot();
     let evaluation = rules::evaluate(&snapshot);
     let findings = evaluation.findings;
@@ -59,7 +110,7 @@ fn main() {
         passes,
     };
 
-    match cli.format {
+    match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
             Err(err) => {
@@ -67,7 +118,7 @@ fn main() {
                 std::process::exit(3);
             }
         },
-        OutputFormat::Text => print_text_report(&report, &cli.output_level, cli.verbose),
+        OutputFormat::Text => print_text_report(&report, &args.output_level, args.verbose),
     }
 
     if report.summary.errors > 0 {
@@ -75,6 +126,79 @@ fn main() {
     }
     if report.summary.warnings > 0 {
         std::process::exit(1);
+    }
+}
+
+fn run_e2e(args: E2eArgs) {
+    let snapshot = probe::collect_snapshot();
+    let interfaces = args
+        .interfaces
+        .as_ref()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    let config = E2eConfig {
+        interfaces,
+        include_non_physical: args.include_non_physical,
+        timeout_ms: args.timeout_ms,
+        retries: args.retries,
+        port_base: args.port_base,
+    };
+
+    let report = e2e::run(&snapshot, &config);
+
+    match args.format {
+        OutputFormat::Json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(err) => {
+                eprintln!("failed to serialize JSON report: {err}");
+                std::process::exit(3);
+            }
+        },
+        OutputFormat::Text => print_e2e_text_report(&report, args.verbose),
+    }
+
+    if report.summary.failed > 0 {
+        std::process::exit(2);
+    }
+    if report.summary.skipped > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn print_e2e_text_report(report: &E2eReport, verbose: bool) {
+    println!("xdp-system-compat e2e");
+    println!(
+        "  interfaces tested: {} ({} passed, {} failed, {} skipped)",
+        report.summary.tested, report.summary.passed, report.summary.failed, report.summary.skipped
+    );
+
+    if report.results.is_empty() {
+        println!("\nNo interfaces matched e2e test selection.");
+        return;
+    }
+
+    println!("\nE2E Results:");
+    for result in &report.results {
+        if !verbose && matches!(result.status, E2eStatus::Skip) {
+            continue;
+        }
+        let status = match result.status {
+            E2eStatus::Pass => "PASS",
+            E2eStatus::Fail => "FAIL",
+            E2eStatus::Skip => "SKIP",
+        };
+        println!(
+            "- {} [{}] attempts={} sent={} recv={}",
+            result.interface, status, result.attempts, result.packets_sent, result.packets_received
+        );
+        println!("  reason: {}", result.reason);
     }
 }
 
