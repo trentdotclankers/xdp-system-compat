@@ -1,14 +1,5 @@
-use {
-    crate::model::{
-        E2eInterfaceResult, E2eReport, E2eStatus, E2eSummary, HostSnapshot, ProbeResult,
-    },
-    std::{
-        ffi::CString,
-        io,
-        net::{Ipv4Addr, SocketAddrV4, UdpSocket},
-        os::fd::{AsRawFd, FromRawFd},
-        time::Duration,
-    },
+use crate::model::{
+    E2eInterfaceResult, E2eReport, E2eStatus, E2eSummary, HostSnapshot, ProbeResult,
 };
 
 #[derive(Debug, Clone)]
@@ -27,7 +18,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
         results.push(E2eInterfaceResult {
             interface: "<all>".to_string(),
             status: E2eStatus::Skip,
-            reason: "e2e xdp tests are only supported on linux".to_string(),
+            reason: "xdp e2e tests are only supported on linux".to_string(),
             packets_sent: 0,
             packets_received: 0,
             attempts: 0,
@@ -52,7 +43,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
         }
     };
 
-    for (index, iface) in ifaces.iter().enumerate() {
+    for iface in ifaces {
         if let Some(filter) = &config.interfaces {
             if !filter.iter().any(|candidate| candidate == &iface.name) {
                 continue;
@@ -75,22 +66,77 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             continue;
         }
 
-        let Some(ipv4_addr) = interface_ipv4_addr(&iface.name) else {
+        if iface.rx_queues == 0 || iface.tx_queues == 0 {
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Skip,
-                reason: "interface has no usable ipv4 address".to_string(),
+                reason: "interface has no rx/tx queues".to_string(),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
             });
             continue;
-        };
+        }
 
-        let base = u32::from(config.port_base);
-        let offset = (index as u32).saturating_mul(config.retries + 1);
-        let result = run_interface_test(&iface.name, ipv4_addr, base + offset, config);
-        results.push(result);
+        let attempts = config.retries.max(1);
+        let mut last_err: Option<String> = None;
+        let mut pass_reason = None;
+
+        for _ in 0..attempts {
+            match run_af_xdp_probe(&iface.name) {
+                Ok(zero_copy_supported) => {
+                    pass_reason = Some(if zero_copy_supported {
+                        "af_xdp socket + umem + rings + bind succeeded (zerocopy supported)"
+                            .to_string()
+                    } else {
+                        "af_xdp socket + umem + rings + bind succeeded (copy mode only)".to_string()
+                    });
+                    break;
+                }
+                Err(AfXdpProbeError::Permission(err)) => {
+                    results.push(E2eInterfaceResult {
+                        interface: iface.name.clone(),
+                        status: E2eStatus::Skip,
+                        reason: format!("xdp probe blocked by permissions/capabilities: {err}"),
+                        packets_sent: 0,
+                        packets_received: 0,
+                        attempts: 0,
+                    });
+                    pass_reason = None;
+                    last_err = None;
+                    break;
+                }
+                Err(AfXdpProbeError::Incompatible(err)) => {
+                    last_err = Some(err);
+                }
+                Err(AfXdpProbeError::Transient(err)) => {
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if let Some(reason) = pass_reason {
+            results.push(E2eInterfaceResult {
+                interface: iface.name.clone(),
+                status: E2eStatus::Pass,
+                reason,
+                packets_sent: 0,
+                packets_received: 0,
+                attempts,
+            });
+            continue;
+        }
+
+        if let Some(reason) = last_err {
+            results.push(E2eInterfaceResult {
+                interface: iface.name.clone(),
+                status: E2eStatus::Fail,
+                reason,
+                packets_sent: 0,
+                packets_received: 0,
+                attempts,
+            });
+        }
     }
 
     finalize(results)
@@ -122,210 +168,239 @@ fn finalize(results: Vec<E2eInterfaceResult>) -> E2eReport {
     }
 }
 
-fn run_interface_test(
-    interface: &str,
-    ipv4_addr: Ipv4Addr,
-    port_seed: u32,
-    config: &E2eConfig,
-) -> E2eInterfaceResult {
-    let timeout = Duration::from_millis(config.timeout_ms.max(1));
+#[derive(Debug)]
+enum AfXdpProbeError {
+    Permission(String),
+    Incompatible(String),
+    Transient(String),
+}
 
-    let mut packets_sent = 0u64;
-    let mut packets_received = 0u64;
+#[cfg(target_os = "linux")]
+fn run_af_xdp_probe(interface: &str) -> Result<bool, AfXdpProbeError> {
+    use {
+        caps::{
+            CapSet,
+            Capability::{CAP_NET_RAW, CAP_SYS_ADMIN},
+        },
+        std::{
+            ffi::CString,
+            io, mem,
+            os::fd::{AsRawFd, FromRawFd},
+            ptr,
+        },
+    };
 
-    for attempt in 1..=config.retries.max(1) {
-        let port = (port_seed + attempt).clamp(1024, u16::MAX as u32) as u16;
-        let bind_addr = SocketAddrV4::new(ipv4_addr, port);
-        let server = match udp_bind(bind_addr) {
-            Ok(sock) => sock,
-            Err(err) => {
-                return E2eInterfaceResult {
-                    interface: interface.to_string(),
-                    status: E2eStatus::Fail,
-                    reason: format!("failed to bind server socket on {bind_addr}: {err}"),
-                    packets_sent,
-                    packets_received,
-                    attempts: attempt,
-                };
-            }
-        };
+    fn is_perm(err: &io::Error) -> bool {
+        matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES))
+    }
 
-        if let Err(err) = bind_to_device(&server, interface) {
-            return E2eInterfaceResult {
-                interface: interface.to_string(),
-                status: E2eStatus::Skip,
-                reason: format!("failed to bind server socket to interface {interface}: {err}"),
-                packets_sent,
-                packets_received,
-                attempts: attempt,
-            };
-        }
+    let ifname = CString::new(interface)
+        .map_err(|_| AfXdpProbeError::Transient("invalid interface name".to_string()))?;
 
-        if let Err(err) = server.set_read_timeout(Some(timeout)) {
-            return E2eInterfaceResult {
-                interface: interface.to_string(),
-                status: E2eStatus::Fail,
-                reason: format!("failed setting server timeout: {err}"),
-                packets_sent,
-                packets_received,
-                attempts: attempt,
-            };
-        }
+    // Safety: libc wrapper with valid c string pointer.
+    let ifindex = unsafe { libc::if_nametoindex(ifname.as_ptr()) };
+    if ifindex == 0 {
+        return Err(AfXdpProbeError::Incompatible(format!(
+            "interface '{interface}' has no ifindex"
+        )));
+    }
 
-        let client = match udp_bind(SocketAddrV4::new(ipv4_addr, 0)) {
-            Ok(sock) => sock,
-            Err(err) => {
-                return E2eInterfaceResult {
-                    interface: interface.to_string(),
-                    status: E2eStatus::Fail,
-                    reason: format!("failed to bind client socket to {ipv4_addr}: {err}"),
-                    packets_sent,
-                    packets_received,
-                    attempts: attempt,
-                };
-            }
-        };
+    let permitted = caps::read(None, CapSet::Permitted)
+        .map_err(|e| AfXdpProbeError::Transient(format!("read permitted caps failed: {e}")))?;
+    if !permitted.contains(&CAP_NET_RAW) {
+        return Err(AfXdpProbeError::Permission(
+            "CAP_NET_RAW is not in permitted set".to_string(),
+        ));
+    }
 
-        if let Err(err) = bind_to_device(&client, interface) {
-            return E2eInterfaceResult {
-                interface: interface.to_string(),
-                status: E2eStatus::Skip,
-                reason: format!("failed to bind client socket to interface {interface}: {err}"),
-                packets_sent,
-                packets_received,
-                attempts: attempt,
-            };
-        }
-
-        let payload = format!("xdp-e2e:{interface}:{attempt}:{port}").into_bytes();
-
-        match client.send_to(&payload, bind_addr) {
-            Ok(_) => packets_sent += 1,
-            Err(err) => {
-                return E2eInterfaceResult {
-                    interface: interface.to_string(),
-                    status: E2eStatus::Fail,
-                    reason: format!("client send failed: {err}"),
-                    packets_sent,
-                    packets_received,
-                    attempts: attempt,
-                };
-            }
-        }
-
-        let mut buf = vec![0u8; payload.len().saturating_add(64)];
-        match server.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                packets_received += 1;
-                let received = &buf[..n];
-                if received == payload.as_slice() {
-                    return E2eInterfaceResult {
-                        interface: interface.to_string(),
-                        status: E2eStatus::Pass,
-                        reason: "udp client/server roundtrip succeeded via interface binding"
-                            .to_string(),
-                        packets_sent,
-                        packets_received,
-                        attempts: attempt,
-                    };
-                }
-            }
-            Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock
-                    || err.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(err) => {
-                return E2eInterfaceResult {
-                    interface: interface.to_string(),
-                    status: E2eStatus::Fail,
-                    reason: format!("server receive failed: {err}"),
-                    packets_sent,
-                    packets_received,
-                    attempts: attempt,
-                };
-            }
+    let mut raised = Vec::new();
+    for cap in [CAP_NET_RAW, CAP_SYS_ADMIN] {
+        if permitted.contains(&cap) && caps::raise(None, CapSet::Effective, cap).is_ok() {
+            raised.push(cap);
         }
     }
 
-    E2eInterfaceResult {
-        interface: interface.to_string(),
-        status: E2eStatus::Fail,
-        reason: "timed out waiting for e2e test payload".to_string(),
-        packets_sent,
-        packets_received,
-        attempts: config.retries.max(1),
+    // Safety: direct syscall wrapper.
+    let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        for cap in raised.iter().rev() {
+            let _ = caps::drop(None, CapSet::Effective, *cap);
+        }
+        if is_perm(&err) {
+            return Err(AfXdpProbeError::Permission(format!(
+                "socket(AF_XDP) denied: {err}"
+            )));
+        }
+        return Err(AfXdpProbeError::Incompatible(format!(
+            "socket(AF_XDP) failed: {err}"
+        )));
+    }
+
+    // Safety: fd is from socket.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+
+    let chunk_size = 4096usize;
+    let frame_count = 256usize;
+    let len = chunk_size * frame_count;
+
+    // Safety: anonymous private mapping.
+    let umem_ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if std::ptr::eq(umem_ptr, libc::MAP_FAILED) {
+        let err = io::Error::last_os_error();
+        for cap in raised.iter().rev() {
+            let _ = caps::drop(None, CapSet::Effective, *cap);
+        }
+        return Err(AfXdpProbeError::Transient(format!(
+            "umem mmap failed: {err}"
+        )));
+    }
+
+    // Safety: plain data struct.
+    let mut reg: libc::xdp_umem_reg = unsafe { mem::zeroed() };
+    reg.addr = umem_ptr as u64;
+    reg.len = len as u64;
+    reg.chunk_size = chunk_size as u32;
+    reg.headroom = 0;
+    reg.flags = 0;
+    reg.tx_metadata_len = 0;
+
+    // Safety: valid fd and pointer to reg.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_XDP,
+            libc::XDP_UMEM_REG,
+            &reg as *const _ as *const libc::c_void,
+            mem::size_of::<libc::xdp_umem_reg>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        // Safety: unmap pointer allocated above.
+        unsafe {
+            libc::munmap(umem_ptr, len);
+        }
+        for cap in raised.iter().rev() {
+            let _ = caps::drop(None, CapSet::Effective, *cap);
+        }
+        if is_perm(&err) {
+            return Err(AfXdpProbeError::Permission(format!(
+                "XDP_UMEM_REG denied: {err}"
+            )));
+        }
+        return Err(AfXdpProbeError::Incompatible(format!(
+            "XDP_UMEM_REG failed: {err}"
+        )));
+    }
+
+    let ring_size: u32 = 64;
+    for ring in [
+        libc::XDP_UMEM_COMPLETION_RING,
+        libc::XDP_UMEM_FILL_RING,
+        libc::XDP_TX_RING,
+        libc::XDP_RX_RING,
+    ] {
+        // Safety: valid fd and pointer to ring size.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_XDP,
+                ring,
+                &ring_size as *const _ as *const libc::c_void,
+                mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            // Safety: unmap pointer allocated above.
+            unsafe {
+                libc::munmap(umem_ptr, len);
+            }
+            for cap in raised.iter().rev() {
+                let _ = caps::drop(None, CapSet::Effective, *cap);
+            }
+            if is_perm(&err) {
+                return Err(AfXdpProbeError::Permission(format!(
+                    "setting XDP ring {ring} denied: {err}"
+                )));
+            }
+            return Err(AfXdpProbeError::Incompatible(format!(
+                "setting XDP ring {ring} failed: {err}"
+            )));
+        }
+    }
+
+    let copy_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, false);
+    let zc_ok = bind_xdp_socket(fd.as_raw_fd(), ifindex, true);
+
+    // Safety: unmap pointer allocated above.
+    unsafe {
+        libc::munmap(umem_ptr, len);
+    }
+    for cap in raised.iter().rev() {
+        let _ = caps::drop(None, CapSet::Effective, *cap);
+    }
+
+    match copy_ok {
+        Ok(()) => Ok(zc_ok.is_ok()),
+        Err(err) => {
+            if is_perm(&err) {
+                Err(AfXdpProbeError::Permission(format!(
+                    "AF_XDP bind denied: {err}"
+                )))
+            } else {
+                Err(AfXdpProbeError::Incompatible(format!(
+                    "AF_XDP bind failed: {err}"
+                )))
+            }
+        }
     }
 }
 
-fn bind_to_device(socket: &UdpSocket, interface: &str) -> io::Result<()> {
-    let iface = CString::new(interface).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "interface name contains interior null byte",
-        )
-    })?;
+#[cfg(target_os = "linux")]
+fn bind_xdp_socket(fd: std::os::fd::RawFd, ifindex: u32, zero_copy: bool) -> std::io::Result<()> {
+    use std::mem;
 
-    // Safety: setsockopt with valid fd and pointer to a NUL-terminated interface string.
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            iface.as_ptr() as *const libc::c_void,
-            iface.as_bytes_with_nul().len() as libc::socklen_t,
-        )
+    let sxdp = libc::sockaddr_xdp {
+        sxdp_family: libc::AF_XDP as libc::sa_family_t,
+        sxdp_flags: libc::XDP_USE_NEED_WAKEUP
+            | if zero_copy {
+                libc::XDP_ZEROCOPY
+            } else {
+                libc::XDP_COPY
+            },
+        sxdp_ifindex: ifindex,
+        sxdp_queue_id: 0,
+        sxdp_shared_umem_fd: 0,
     };
 
+    // Safety: valid fd and socket address data.
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sxdp as *const _ as *const libc::sockaddr,
+            mem::size_of::<libc::sockaddr_xdp>() as libc::socklen_t,
+        )
+    };
     if rc < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn interface_ipv4_addr(interface: &str) -> Option<Ipv4Addr> {
-    let ifname = CString::new(interface).ok()?;
-
-    // Safety: direct libc call with static params.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return None;
-    }
-
-    // Safety: fd returned by socket.
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-
-    // Safety: zeroed ifreq is valid initial memory.
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name = ifname.as_bytes_with_nul();
-    let len = name.len().min(libc::IF_NAMESIZE);
-    // Safety: destination buffer is valid and bounded.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr() as *const libc::c_char,
-            req.ifr_name.as_mut_ptr(),
-            len,
-        );
-    }
-
-    // Safety: valid fd and pointer for ioctl.
-    let res = unsafe { libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFADDR, &mut req) };
-    if res < 0 {
-        return None;
-    }
-
-    // Safety: SIOCGIFADDR returned success, addr is populated.
-    let addr = unsafe {
-        let addr_ptr = &req.ifr_ifru.ifru_addr as *const libc::sockaddr;
-        let sin_addr = (*(addr_ptr as *const libc::sockaddr_in)).sin_addr;
-        Ipv4Addr::from(sin_addr.s_addr.to_ne_bytes())
-    };
-
-    Some(addr)
-}
-
-#[allow(clippy::disallowed_methods)]
-fn udp_bind(addr: SocketAddrV4) -> io::Result<UdpSocket> {
-    UdpSocket::bind(addr)
+#[cfg(not(target_os = "linux"))]
+fn run_af_xdp_probe(_interface: &str) -> Result<bool, AfXdpProbeError> {
+    Err(AfXdpProbeError::Transient(
+        "AF_XDP probe is only supported on linux".to_string(),
+    ))
 }
