@@ -10,12 +10,20 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, clap::ValueEnum, PartialEq, Eq)]
+enum OutputLevel {
+    Basic,
+    Extended,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "xdp-system-compat")]
 #[command(about = "Probe host compatibility constraints for Agave XDP retransmit")]
 struct Cli {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    #[arg(long, value_enum, default_value_t = OutputLevel::Basic)]
+    output_level: OutputLevel,
 }
 
 fn main() {
@@ -53,7 +61,7 @@ fn main() {
                 std::process::exit(3);
             }
         },
-        OutputFormat::Text => print_text_report(&report),
+        OutputFormat::Text => print_text_report(&report, &cli.output_level),
     }
 
     if report.summary.errors > 0 {
@@ -64,7 +72,7 @@ fn main() {
     }
 }
 
-fn print_text_report(report: &Report) {
+fn print_text_report(report: &Report, output_level: &OutputLevel) {
     println!("xdp-system-compat");
     println!("  os: {}", report.host.os);
     if let Some(release) = &report.host.kernel_release {
@@ -81,18 +89,99 @@ fn print_text_report(report: &Report) {
 
     if report.findings.is_empty() {
         println!("\nNo compatibility constraints detected.");
-        return;
+    } else {
+        println!("\nFindings:");
+        for f in &report.findings {
+            let severity = match f.severity {
+                Severity::Error => "ERROR",
+                Severity::Warn => "WARN",
+            };
+            println!("- [{}] {} {}", f.id, severity, f.title);
+            println!("  details: {}", f.details);
+            println!("  remediation: {}", f.remediation);
+        }
     }
 
-    println!("\nFindings:");
-    for f in &report.findings {
-        let severity = match f.severity {
-            Severity::Error => "ERROR",
-            Severity::Warn => "WARN",
-        };
-        println!("- [{}] {} {}", f.id, severity, f.title);
-        println!("  details: {}", f.details);
-        println!("  remediation: {}", f.remediation);
+    print_operator_context(report, output_level);
+}
+
+fn print_operator_context(report: &Report, output_level: &OutputLevel) {
+    println!("\nOperator Context:");
+
+    if let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology {
+        println!("  cpu: {} logical cores online", cpu.logical_core_count);
+        if *output_level == OutputLevel::Extended {
+            println!("  cpu online list: {:?}", cpu.online_cores);
+            println!("  smt sibling sets: {:?}", cpu.smt_sibling_sets);
+            for core in &cpu.core_to_numa {
+                println!(
+                    "  cpu core {} -> numa {}",
+                    core.core_id,
+                    core.numa_node
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                );
+            }
+        }
+    } else {
+        println!("  cpu: topology probe unavailable");
+    }
+
+    if let ProbeResult::Ok { value: numa } = &report.host.operator_context.numa_topology {
+        println!("  numa: {} node(s)", numa.nodes.len());
+        if *output_level == OutputLevel::Extended {
+            for node in &numa.nodes {
+                println!(
+                    "  numa node {}: mem_total_kb={:?} mem_free_kb={:?}",
+                    node.node_id, node.mem_total_kb, node.mem_free_kb
+                );
+            }
+        }
+    } else {
+        println!("  numa: topology probe unavailable");
+    }
+
+    match &report.host.interfaces {
+        ProbeResult::Ok { value: ifaces } => {
+            println!("  interfaces: {} discovered", ifaces.len());
+            for iface in ifaces {
+                if *output_level == OutputLevel::Basic {
+                    println!(
+                        "  - {}: rxq={} txq={} device={} bond={}",
+                        iface.name,
+                        iface.rx_queues,
+                        iface.tx_queues,
+                        iface.has_device,
+                        iface.is_bond
+                    );
+                    continue;
+                }
+                println!(
+                    "  - {}: rxq={} txq={} device={} bond={} operstate={:?} mtu={:?} speed_mbps={:?} driver={:?} pci={:?} numa={:?}",
+                    iface.name,
+                    iface.rx_queues,
+                    iface.tx_queues,
+                    iface.has_device,
+                    iface.is_bond,
+                    probe_ok_value(&iface.operstate),
+                    probe_ok_value(&iface.mtu),
+                    probe_ok_value(&iface.speed_mbps),
+                    probe_ok_value(&iface.driver),
+                    probe_ok_value(&iface.pci_address),
+                    probe_ok_value(&iface.numa_node),
+                );
+            }
+        }
+        _ => println!("  interfaces: inventory probe unavailable"),
+    }
+}
+
+fn probe_ok_value<T>(probe: &ProbeResult<T>) -> Option<&T> {
+    match probe {
+        ProbeResult::Ok { value } => Some(value),
+        ProbeResult::Blocked { .. }
+        | ProbeResult::Failed { .. }
+        | ProbeResult::Unavailable { .. } => None,
     }
 }
 
@@ -131,10 +220,48 @@ fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
         &mut failed,
         &mut unavailable,
     );
+    accumulate_probe_state(
+        &snapshot.operator_context.cpu_topology,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.operator_context.numa_topology,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
 
     if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
         for iface in interfaces {
             accumulate_probe_state(&iface.has_ipv4, &mut blocked, &mut failed, &mut unavailable);
+            accumulate_probe_state(&iface.driver, &mut blocked, &mut failed, &mut unavailable);
+            accumulate_probe_state(
+                &iface.pci_address,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
+            accumulate_probe_state(
+                &iface.numa_node,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
+            accumulate_probe_state(
+                &iface.operstate,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
+            accumulate_probe_state(&iface.mtu, &mut blocked, &mut failed, &mut unavailable);
+            accumulate_probe_state(
+                &iface.speed_mbps,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
         }
     }
 

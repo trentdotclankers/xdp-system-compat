@@ -1,5 +1,8 @@
 use xdp_system_compat::{
-    model::{CapabilityState, HostSnapshot, InterfaceInfo, ProbeResult},
+    model::{
+        CapabilityState, CpuTopologyInfo, HostSnapshot, InterfaceInfo, NumaTopologyInfo,
+        OperatorContext, ProbeResult,
+    },
     rules::evaluate,
 };
 
@@ -13,9 +16,25 @@ fn default_route_missing_generates_warning() {
             name: "eth0".to_string(),
             has_device: true,
             is_bond: false,
+            rx_queues: 4,
             tx_queues: 4,
+            driver: ProbeResult::ok(Some("ixgbe".to_string())),
+            pci_address: ProbeResult::ok(Some("0000:3b:00.0".to_string())),
+            numa_node: ProbeResult::ok(Some(0)),
+            operstate: ProbeResult::ok("up".to_string()),
+            mtu: ProbeResult::ok(1500),
+            speed_mbps: ProbeResult::ok(Some(25_000)),
             has_ipv4: ProbeResult::ok(true),
         }]),
+        operator_context: OperatorContext {
+            cpu_topology: ProbeResult::ok(CpuTopologyInfo {
+                logical_core_count: 8,
+                online_cores: vec![0, 1, 2, 3, 4, 5, 6, 7],
+                core_to_numa: vec![],
+                smt_sibling_sets: vec![],
+            }),
+            numa_topology: ProbeResult::ok(NumaTopologyInfo { nodes: vec![] }),
+        },
         default_route_interface: ProbeResult::ok(None),
         capabilities_permitted: ProbeResult::ok(CapabilityState {
             cap_net_admin: true,

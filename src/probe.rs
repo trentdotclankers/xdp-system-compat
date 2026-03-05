@@ -1,4 +1,7 @@
-use crate::model::{CapabilityState, HostSnapshot, InterfaceInfo, ProbeResult};
+use crate::model::{
+    CapabilityState, CpuCoreInfo, CpuTopologyInfo, HostSnapshot, InterfaceInfo, NumaNodeInfo,
+    NumaTopologyInfo, OperatorContext, ProbeResult,
+};
 use std::{
     ffi::CString,
     fs, io, mem,
@@ -16,6 +19,8 @@ pub fn collect_snapshot() -> HostSnapshot {
     let memlock_bytes = parse_memlock_limit();
 
     // Phase C: passive sysfs/proc reads.
+    let cpu_topology = probe_cpu_topology();
+    let numa_topology = probe_numa_topology();
     let mut interfaces = probe_interfaces();
     let default_route_interface = default_route_interface();
 
@@ -31,6 +36,10 @@ pub fn collect_snapshot() -> HostSnapshot {
         kernel_release,
         af_xdp_supported,
         interfaces,
+        operator_context: OperatorContext {
+            cpu_topology,
+            numa_topology,
+        },
         default_route_interface,
         capabilities_permitted,
         memlock_bytes,
@@ -183,13 +192,21 @@ fn probe_interfaces() -> ProbeResult<Vec<InterfaceInfo>> {
         let base = net_dir.join(&iface);
         let has_device = base.join("device").exists();
         let is_bond = base.join("bonding").exists();
+        let rx_queues = count_rx_queues(&base);
         let tx_queues = count_tx_queues(&base);
 
         interfaces.push(InterfaceInfo {
             name: iface,
             has_device,
             is_bond,
+            rx_queues,
             tx_queues,
+            driver: probe_interface_driver(&base),
+            pci_address: probe_interface_pci_address(&base),
+            numa_node: probe_interface_numa_node(&base),
+            operstate: probe_interface_operstate(&base),
+            mtu: probe_interface_mtu(&base),
+            speed_mbps: probe_interface_speed(&base),
             has_ipv4: ProbeResult::Unavailable {
                 reason: "IPv4 probe not executed yet".to_string(),
             },
@@ -198,6 +215,20 @@ fn probe_interfaces() -> ProbeResult<Vec<InterfaceInfo>> {
 
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
     ProbeResult::ok(interfaces)
+}
+
+fn count_rx_queues(base: &Path) -> usize {
+    let queue_dir = base.join("queues");
+    let entries = match fs::read_dir(queue_dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("rx-"))
+        .count()
 }
 
 fn count_tx_queues(base: &Path) -> usize {
@@ -236,6 +267,259 @@ fn default_route_interface() -> ProbeResult<Option<String>> {
         }
     }
     ProbeResult::ok(None)
+}
+
+fn probe_cpu_topology() -> ProbeResult<CpuTopologyInfo> {
+    let online = match fs::read_to_string("/sys/devices/system/cpu/online") {
+        Ok(online) => online,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read CPU online list: {err}"),
+            };
+        }
+    };
+
+    let online_cores = match parse_cpu_list(online.trim()) {
+        Ok(cores) => cores,
+        Err(reason) => return ProbeResult::Failed { reason },
+    };
+
+    let mut core_to_numa = Vec::with_capacity(online_cores.len());
+    let mut sibling_sets = Vec::<Vec<usize>>::new();
+    for core in &online_cores {
+        let cpu_dir = format!("/sys/devices/system/cpu/cpu{core}");
+        let numa_node = probe_cpu_numa_node(Path::new(&cpu_dir));
+        core_to_numa.push(CpuCoreInfo {
+            core_id: *core,
+            numa_node,
+        });
+
+        if let Ok(siblings) = fs::read_to_string(format!("{cpu_dir}/topology/thread_siblings_list"))
+        {
+            if let Ok(mut set) = parse_cpu_list(siblings.trim()) {
+                set.sort_unstable();
+                if !sibling_sets.contains(&set) {
+                    sibling_sets.push(set);
+                }
+            }
+        }
+    }
+    sibling_sets.sort();
+
+    ProbeResult::ok(CpuTopologyInfo {
+        logical_core_count: online_cores.len(),
+        online_cores,
+        core_to_numa,
+        smt_sibling_sets: sibling_sets,
+    })
+}
+
+fn probe_cpu_numa_node(cpu_dir: &Path) -> Option<usize> {
+    let entries = fs::read_dir(cpu_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(id) = name.strip_prefix("node") {
+            if let Ok(node_id) = id.parse::<usize>() {
+                return Some(node_id);
+            }
+        }
+    }
+    None
+}
+
+fn probe_numa_topology() -> ProbeResult<NumaTopologyInfo> {
+    let node_dir = Path::new("/sys/devices/system/node");
+    let entries = match fs::read_dir(node_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return ProbeResult::Unavailable {
+                reason: format!("failed to read NUMA node directory: {err}"),
+            };
+        }
+    };
+
+    let mut nodes = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(id) = name.strip_prefix("node") else {
+            continue;
+        };
+        let Ok(node_id) = id.parse::<usize>() else {
+            continue;
+        };
+        let meminfo = fs::read_to_string(entry.path().join("meminfo")).ok();
+        let (mem_total_kb, mem_free_kb) = parse_numa_meminfo(meminfo.as_deref());
+        nodes.push(NumaNodeInfo {
+            node_id,
+            mem_total_kb,
+            mem_free_kb,
+        });
+    }
+    nodes.sort_by_key(|n| n.node_id);
+
+    if nodes.is_empty() {
+        return ProbeResult::Unavailable {
+            reason: "no NUMA node entries found".to_string(),
+        };
+    }
+
+    ProbeResult::ok(NumaTopologyInfo { nodes })
+}
+
+fn parse_numa_meminfo(meminfo: Option<&str>) -> (Option<u64>, Option<u64>) {
+    let Some(meminfo) = meminfo else {
+        return (None, None);
+    };
+    let mut total = None;
+    let mut free = None;
+    for line in meminfo.lines() {
+        if line.contains("MemTotal") {
+            total = parse_last_u64(line);
+        } else if line.contains("MemFree") {
+            free = parse_last_u64(line);
+        }
+    }
+    (total, free)
+}
+
+fn parse_last_u64(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .rev()
+        .find_map(|t| t.parse::<u64>().ok())
+}
+
+fn parse_cpu_list(list: &str) -> Result<Vec<usize>, String> {
+    if list.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start
+                .parse::<usize>()
+                .map_err(|e| format!("invalid CPU range start '{start}': {e}"))?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|e| format!("invalid CPU range end '{end}': {e}"))?;
+            if end < start {
+                return Err(format!("invalid descending CPU range '{part}'"));
+            }
+            cpus.extend(start..=end);
+        } else {
+            let cpu = part
+                .parse::<usize>()
+                .map_err(|e| format!("invalid CPU id '{part}': {e}"))?;
+            cpus.push(cpu);
+        }
+    }
+    cpus.sort_unstable();
+    cpus.dedup();
+    Ok(cpus)
+}
+
+fn probe_interface_driver(base: &Path) -> ProbeResult<Option<String>> {
+    if !base.join("device").exists() {
+        return ProbeResult::Unavailable {
+            reason: "interface has no backing device".to_string(),
+        };
+    }
+    match fs::read_link(base.join("device/driver")) {
+        Ok(path) => ProbeResult::ok(path.file_name().map(|s| s.to_string_lossy().to_string())),
+        Err(err) => ProbeResult::Failed {
+            reason: format!("failed to read driver link: {err}"),
+        },
+    }
+}
+
+fn probe_interface_pci_address(base: &Path) -> ProbeResult<Option<String>> {
+    if !base.join("device").exists() {
+        return ProbeResult::Unavailable {
+            reason: "interface has no backing device".to_string(),
+        };
+    }
+    match fs::read_link(base.join("device")) {
+        Ok(path) => ProbeResult::ok(path.file_name().map(|s| s.to_string_lossy().to_string())),
+        Err(err) => ProbeResult::Failed {
+            reason: format!("failed to read device symlink: {err}"),
+        },
+    }
+}
+
+fn probe_interface_numa_node(base: &Path) -> ProbeResult<Option<usize>> {
+    if !base.join("device").exists() {
+        return ProbeResult::Unavailable {
+            reason: "interface has no backing device".to_string(),
+        };
+    }
+    let path = base.join("device/numa_node");
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            let value = value.trim();
+            let parsed = value.parse::<i32>().ok();
+            match parsed {
+                Some(v) if v >= 0 => ProbeResult::ok(Some(v as usize)),
+                Some(_) => ProbeResult::ok(None),
+                None => ProbeResult::Failed {
+                    reason: format!("failed to parse numa_node value '{value}'"),
+                },
+            }
+        }
+        Err(err) => ProbeResult::Failed {
+            reason: format!("failed to read interface numa_node: {err}"),
+        },
+    }
+}
+
+fn probe_interface_operstate(base: &Path) -> ProbeResult<String> {
+    match fs::read_to_string(base.join("operstate")) {
+        Ok(state) => ProbeResult::ok(state.trim().to_string()),
+        Err(err) => ProbeResult::Failed {
+            reason: format!("failed to read operstate: {err}"),
+        },
+    }
+}
+
+fn probe_interface_mtu(base: &Path) -> ProbeResult<u32> {
+    match fs::read_to_string(base.join("mtu")) {
+        Ok(mtu) => match mtu.trim().parse::<u32>() {
+            Ok(v) => ProbeResult::ok(v),
+            Err(err) => ProbeResult::Failed {
+                reason: format!("failed to parse mtu '{}': {err}", mtu.trim()),
+            },
+        },
+        Err(err) => ProbeResult::Failed {
+            reason: format!("failed to read mtu: {err}"),
+        },
+    }
+}
+
+fn probe_interface_speed(base: &Path) -> ProbeResult<Option<u64>> {
+    match fs::read_to_string(base.join("speed")) {
+        Ok(speed) => {
+            let speed = speed.trim();
+            match speed.parse::<i64>() {
+                Ok(v) if v >= 0 => ProbeResult::ok(Some(v as u64)),
+                Ok(_) => ProbeResult::ok(None),
+                Err(err) => ProbeResult::Failed {
+                    reason: format!("failed to parse speed '{}': {err}", speed),
+                },
+            }
+        }
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) {
+                ProbeResult::Unavailable {
+                    reason: format!("interface speed is not available: {err}"),
+                }
+            } else {
+                ProbeResult::Failed {
+                    reason: format!("failed to read speed: {err}"),
+                }
+            }
+        }
+    }
 }
 
 fn probe_capabilities() -> ProbeResult<CapabilityState> {

@@ -51,8 +51,47 @@ pub struct InterfaceInfo {
     pub name: String,
     pub has_device: bool,
     pub is_bond: bool,
+    pub rx_queues: usize,
     pub tx_queues: usize,
+    pub driver: ProbeResult<Option<String>>,
+    pub pci_address: ProbeResult<Option<String>>,
+    pub numa_node: ProbeResult<Option<usize>>,
+    pub operstate: ProbeResult<String>,
+    pub mtu: ProbeResult<u32>,
+    pub speed_mbps: ProbeResult<Option<u64>>,
     pub has_ipv4: ProbeResult<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuCoreInfo {
+    pub core_id: usize,
+    pub numa_node: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CpuTopologyInfo {
+    pub logical_core_count: usize,
+    pub online_cores: Vec<usize>,
+    pub core_to_numa: Vec<CpuCoreInfo>,
+    pub smt_sibling_sets: Vec<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NumaNodeInfo {
+    pub node_id: usize,
+    pub mem_total_kb: Option<u64>,
+    pub mem_free_kb: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NumaTopologyInfo {
+    pub nodes: Vec<NumaNodeInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperatorContext {
+    pub cpu_topology: ProbeResult<CpuTopologyInfo>,
+    pub numa_topology: ProbeResult<NumaTopologyInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +108,7 @@ pub struct HostSnapshot {
     pub kernel_release: Option<String>,
     pub af_xdp_supported: ProbeResult<bool>,
     pub interfaces: ProbeResult<Vec<InterfaceInfo>>,
+    pub operator_context: OperatorContext,
     pub default_route_interface: ProbeResult<Option<String>>,
     pub capabilities_permitted: ProbeResult<CapabilityState>,
     pub memlock_bytes: ProbeResult<u64>,
