@@ -1,7 +1,7 @@
 use crate::model::{
-    CapabilityState, CpuCoreInfo, CpuTopologyInfo, HostSnapshot, InterfaceInfo, InterfaceIrqInfo,
-    InterfaceQueueAffinity, IrqInfo, NumaNodeInfo, NumaTopologyInfo, OperatorContext, ProbeResult,
-    QueueCpuMaskInfo,
+    BpfEnvironmentInfo, CapabilityState, CpuCoreInfo, CpuTopologyInfo, HostSnapshot, InterfaceInfo,
+    InterfaceIrqInfo, InterfaceQueueAffinity, IrqInfo, NumaNodeInfo, NumaTopologyInfo,
+    OperatorContext, ProbeResult, QueueCpuMaskInfo, XdpInterfaceStatus, ZcFeasibility,
 };
 use std::{
     ffi::CString,
@@ -26,6 +26,8 @@ pub fn collect_snapshot() -> HostSnapshot {
     let default_route_interface = default_route_interface();
     let irq_topology = probe_irq_topology(&interfaces);
     let queue_cpu_masks = probe_queue_cpu_masks(&interfaces);
+    let xdp_interface_status = probe_xdp_interface_status(&interfaces);
+    let bpf_environment = probe_bpf_environment();
 
     // Phase B: capability context.
     let capabilities_permitted = probe_capabilities();
@@ -44,6 +46,8 @@ pub fn collect_snapshot() -> HostSnapshot {
             numa_topology,
             irq_topology,
             queue_cpu_masks,
+            xdp_interface_status,
+            bpf_environment,
         },
         default_route_interface,
         capabilities_permitted,
@@ -420,6 +424,208 @@ fn probe_queue_cpu_masks(
 fn read_string_probe(path: &Path) -> ProbeResult<String> {
     match fs::read_to_string(path) {
         Ok(v) => ProbeResult::ok(v.trim().to_string()),
+        Err(err) => {
+            if err.kind() == io::ErrorKind::NotFound {
+                ProbeResult::Unavailable {
+                    reason: format!("{} not present", path.display()),
+                }
+            } else if err.kind() == io::ErrorKind::PermissionDenied {
+                ProbeResult::Blocked {
+                    reason: format!("permission denied for {}", path.display()),
+                }
+            } else {
+                ProbeResult::Failed {
+                    reason: format!("failed to read {}: {err}", path.display()),
+                }
+            }
+        }
+    }
+}
+
+fn probe_xdp_interface_status(
+    interfaces: &ProbeResult<Vec<InterfaceInfo>>,
+) -> ProbeResult<Vec<XdpInterfaceStatus>> {
+    let interfaces = match interfaces {
+        ProbeResult::Ok { value } => value,
+        ProbeResult::Blocked { reason } => {
+            return ProbeResult::Blocked {
+                reason: format!("interface inventory blocked: {reason}"),
+            };
+        }
+        ProbeResult::Failed { reason } => {
+            return ProbeResult::Failed {
+                reason: format!("interface inventory failed: {reason}"),
+            };
+        }
+        ProbeResult::Unavailable { reason } => {
+            return ProbeResult::Unavailable {
+                reason: format!("interface inventory unavailable: {reason}"),
+            };
+        }
+    };
+
+    let mut statuses = Vec::new();
+    for iface in interfaces {
+        let xdp_base = Path::new("/sys/class/net").join(&iface.name).join("xdp");
+        let xdp_mode = read_optional_string_probe(&xdp_base.join("mode"));
+        let xdp_prog_id = read_optional_u32_probe(&xdp_base.join("prog_id"));
+        let (zerocopy_feasibility, zerocopy_evidence) = probe_zerocopy_feasibility(iface);
+        statuses.push(XdpInterfaceStatus {
+            interface: iface.name.clone(),
+            xdp_mode,
+            xdp_prog_id,
+            zerocopy_feasibility,
+            zerocopy_evidence,
+        });
+    }
+    ProbeResult::ok(statuses)
+}
+
+fn probe_zerocopy_feasibility(iface: &InterfaceInfo) -> (ZcFeasibility, String) {
+    if !iface.has_device {
+        return (
+            ZcFeasibility::Unsupported,
+            "interface is not backed by a physical device".to_string(),
+        );
+    }
+    match &iface.driver {
+        ProbeResult::Ok {
+            value: Some(driver),
+        } => {
+            let supported = matches!(
+                driver.as_str(),
+                "ixgbe" | "i40e" | "iavf" | "ice" | "mlx5_core" | "ena" | "bnxt_en"
+            );
+            if supported {
+                (
+                    ZcFeasibility::Supported,
+                    format!("driver '{driver}' is in built-in zerocopy support heuristic set"),
+                )
+            } else {
+                (
+                    ZcFeasibility::Unknown,
+                    format!("driver '{driver}' is not in built-in zerocopy heuristic set"),
+                )
+            }
+        }
+        ProbeResult::Ok { value: None } => (
+            ZcFeasibility::Unknown,
+            "no driver detected for interface".to_string(),
+        ),
+        ProbeResult::Blocked { reason } => (
+            ZcFeasibility::Unknown,
+            format!("driver probe blocked: {reason}"),
+        ),
+        ProbeResult::Failed { reason } => (
+            ZcFeasibility::Unknown,
+            format!("driver probe failed: {reason}"),
+        ),
+        ProbeResult::Unavailable { reason } => (
+            ZcFeasibility::Unknown,
+            format!("driver probe unavailable: {reason}"),
+        ),
+    }
+}
+
+fn probe_bpf_environment() -> ProbeResult<BpfEnvironmentInfo> {
+    ProbeResult::ok(BpfEnvironmentInfo {
+        bpffs_mounted: probe_bpffs_mounted(),
+        hugepages_total: probe_meminfo_u64("HugePages_Total"),
+        hugepages_free: probe_meminfo_u64("HugePages_Free"),
+    })
+}
+
+fn probe_bpffs_mounted() -> ProbeResult<bool> {
+    let mounts = match fs::read_to_string("/proc/mounts") {
+        Ok(mounts) => mounts,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /proc/mounts: {err}"),
+            };
+        }
+    };
+    for line in mounts.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 3 {
+            continue;
+        }
+        if fields[1] == "/sys/fs/bpf" && fields[2] == "bpf" {
+            return ProbeResult::ok(true);
+        }
+    }
+    ProbeResult::ok(false)
+}
+
+fn probe_meminfo_u64(key: &str) -> ProbeResult<u64> {
+    let meminfo = match fs::read_to_string("/proc/meminfo") {
+        Ok(meminfo) => meminfo,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /proc/meminfo: {err}"),
+            };
+        }
+    };
+
+    for line in meminfo.lines() {
+        if !line.starts_with(key) {
+            continue;
+        }
+        let value = line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| format!("failed to parse {key} from /proc/meminfo"));
+        return match value {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(parsed) => ProbeResult::ok(parsed),
+                Err(err) => ProbeResult::Failed {
+                    reason: format!("failed to parse {key} value '{v}': {err}"),
+                },
+            },
+            Err(reason) => ProbeResult::Failed { reason },
+        };
+    }
+
+    ProbeResult::Unavailable {
+        reason: format!("{key} not present in /proc/meminfo"),
+    }
+}
+
+fn read_optional_string_probe(path: &Path) -> ProbeResult<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(v) => ProbeResult::ok(Some(v.trim().to_string())),
+        Err(err) => {
+            if err.kind() == io::ErrorKind::NotFound {
+                ProbeResult::Unavailable {
+                    reason: format!("{} not present", path.display()),
+                }
+            } else if err.kind() == io::ErrorKind::PermissionDenied {
+                ProbeResult::Blocked {
+                    reason: format!("permission denied for {}", path.display()),
+                }
+            } else {
+                ProbeResult::Failed {
+                    reason: format!("failed to read {}: {err}", path.display()),
+                }
+            }
+        }
+    }
+}
+
+fn read_optional_u32_probe(path: &Path) -> ProbeResult<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                return ProbeResult::ok(None);
+            }
+            match v.parse::<u32>() {
+                Ok(id) if id > 0 => ProbeResult::ok(Some(id)),
+                Ok(_) => ProbeResult::ok(None),
+                Err(err) => ProbeResult::Failed {
+                    reason: format!("failed to parse {} value '{}': {err}", path.display(), v),
+                },
+            }
+        }
         Err(err) => {
             if err.kind() == io::ErrorKind::NotFound {
                 ProbeResult::Unavailable {

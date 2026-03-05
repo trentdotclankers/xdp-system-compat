@@ -36,6 +36,10 @@ fn default_route_missing_generates_warning() {
             numa_topology: ProbeResult::ok(NumaTopologyInfo { nodes: vec![] }),
             irq_topology: ProbeResult::ok(vec![]),
             queue_cpu_masks: ProbeResult::ok(vec![]),
+            xdp_interface_status: ProbeResult::ok(vec![]),
+            bpf_environment: ProbeResult::Unavailable {
+                reason: "not needed for rules test".to_string(),
+            },
         },
         default_route_interface: ProbeResult::ok(None),
         capabilities_permitted: ProbeResult::ok(CapabilityState {

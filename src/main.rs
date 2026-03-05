@@ -212,6 +212,41 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel) {
     } else {
         println!("  queue cpu masks: probe unavailable");
     }
+
+    if let ProbeResult::Ok {
+        value: xdp_statuses,
+    } = &report.host.operator_context.xdp_interface_status
+    {
+        println!(
+            "  xdp interface status: {} interface entries",
+            xdp_statuses.len()
+        );
+        if *output_level == OutputLevel::Extended {
+            for status in xdp_statuses {
+                println!(
+                    "  xdp {}: mode={:?} prog_id={:?} zerocopy={:?} evidence={}",
+                    status.interface,
+                    probe_ok_value(&status.xdp_mode),
+                    probe_ok_value(&status.xdp_prog_id),
+                    status.zerocopy_feasibility,
+                    status.zerocopy_evidence
+                );
+            }
+        }
+    } else {
+        println!("  xdp interface status: probe unavailable");
+    }
+
+    if let ProbeResult::Ok { value: env } = &report.host.operator_context.bpf_environment {
+        println!(
+            "  bpf environment: bpffs_mounted={:?} hugepages_total={:?} hugepages_free={:?}",
+            probe_ok_value(&env.bpffs_mounted),
+            probe_ok_value(&env.hugepages_total),
+            probe_ok_value(&env.hugepages_free),
+        );
+    } else {
+        println!("  bpf environment: probe unavailable");
+    }
 }
 
 fn probe_ok_value<T>(probe: &ProbeResult<T>) -> Option<&T> {
@@ -282,6 +317,18 @@ fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
         &mut failed,
         &mut unavailable,
     );
+    accumulate_probe_state(
+        &snapshot.operator_context.xdp_interface_status,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.operator_context.bpf_environment,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
 
     if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
         for iface in interfaces {
@@ -344,6 +391,45 @@ fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
                 );
             }
         }
+    }
+    if let ProbeResult::Ok {
+        value: xdp_statuses,
+    } = &snapshot.operator_context.xdp_interface_status
+    {
+        for status in xdp_statuses {
+            accumulate_probe_state(
+                &status.xdp_mode,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
+            accumulate_probe_state(
+                &status.xdp_prog_id,
+                &mut blocked,
+                &mut failed,
+                &mut unavailable,
+            );
+        }
+    }
+    if let ProbeResult::Ok { value: env } = &snapshot.operator_context.bpf_environment {
+        accumulate_probe_state(
+            &env.bpffs_mounted,
+            &mut blocked,
+            &mut failed,
+            &mut unavailable,
+        );
+        accumulate_probe_state(
+            &env.hugepages_total,
+            &mut blocked,
+            &mut failed,
+            &mut unavailable,
+        );
+        accumulate_probe_state(
+            &env.hugepages_free,
+            &mut blocked,
+            &mut failed,
+            &mut unavailable,
+        );
     }
 
     (blocked, failed, unavailable)

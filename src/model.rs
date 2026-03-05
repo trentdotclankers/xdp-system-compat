@@ -94,6 +94,8 @@ pub struct OperatorContext {
     pub numa_topology: ProbeResult<NumaTopologyInfo>,
     pub irq_topology: ProbeResult<Vec<InterfaceIrqInfo>>,
     pub queue_cpu_masks: ProbeResult<Vec<InterfaceQueueAffinity>>,
+    pub xdp_interface_status: ProbeResult<Vec<XdpInterfaceStatus>>,
+    pub bpf_environment: ProbeResult<BpfEnvironmentInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +121,30 @@ pub struct QueueCpuMaskInfo {
 pub struct InterfaceQueueAffinity {
     pub interface: String,
     pub queues: Vec<QueueCpuMaskInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZcFeasibility {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct XdpInterfaceStatus {
+    pub interface: String,
+    pub xdp_mode: ProbeResult<Option<String>>,
+    pub xdp_prog_id: ProbeResult<Option<u32>>,
+    pub zerocopy_feasibility: ZcFeasibility,
+    pub zerocopy_evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BpfEnvironmentInfo {
+    pub bpffs_mounted: ProbeResult<bool>,
+    pub hugepages_total: ProbeResult<u64>,
+    pub hugepages_free: ProbeResult<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

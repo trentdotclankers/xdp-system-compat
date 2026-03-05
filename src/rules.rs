@@ -334,6 +334,10 @@ mod tests {
                 numa_topology: ProbeResult::ok(NumaTopologyInfo { nodes: vec![] }),
                 irq_topology: ProbeResult::ok(vec![]),
                 queue_cpu_masks: ProbeResult::ok(vec![]),
+                xdp_interface_status: ProbeResult::ok(vec![]),
+                bpf_environment: ProbeResult::Unavailable {
+                    reason: "not needed for rules test".to_string(),
+                },
             },
             default_route_interface: ProbeResult::ok(Some("eth0".to_string())),
             capabilities_permitted: ProbeResult::ok(CapabilityState {
