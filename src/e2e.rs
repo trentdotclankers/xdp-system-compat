@@ -18,7 +18,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
         results.push(E2eInterfaceResult {
             interface: "<all>".to_string(),
             status: E2eStatus::Skip,
-            reason: "xdp e2e tests are only supported on linux".to_string(),
+            reason: "AF_XDP probe is only supported on linux".to_string(),
             packets_sent: 0,
             packets_received: 0,
             attempts: 0,
@@ -34,7 +34,9 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             results.push(E2eInterfaceResult {
                 interface: "<all>".to_string(),
                 status: E2eStatus::Skip,
-                reason: format!("interface inventory unavailable: {reason}"),
+                reason: format!(
+                    "AF_XDP probe could not run: interface inventory unavailable: {reason}"
+                ),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -58,7 +60,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Skip,
-                reason: "interface is not up".to_string(),
+                reason: "AF_XDP probe skipped: interface is not up".to_string(),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -70,7 +72,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Skip,
-                reason: "interface has no rx/tx queues".to_string(),
+                reason: "AF_XDP probe skipped: interface has no rx/tx queues".to_string(),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts: 0,
@@ -86,10 +88,10 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             match run_af_xdp_probe(&iface.name) {
                 Ok(zero_copy_supported) => {
                     pass_reason = Some(if zero_copy_supported {
-                        "af_xdp socket + umem + rings + bind succeeded (zerocopy supported)"
+                        "AF_XDP probe passed: socket + UMEM + rings + bind succeeded (zerocopy supported)"
                             .to_string()
                     } else {
-                        "af_xdp socket + umem + rings + bind succeeded (copy mode only)".to_string()
+                        "AF_XDP probe passed: socket + UMEM + rings + bind succeeded (copy mode only)".to_string()
                     });
                     break;
                 }
@@ -97,7 +99,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
                     results.push(E2eInterfaceResult {
                         interface: iface.name.clone(),
                         status: E2eStatus::Skip,
-                        reason: format!("xdp probe blocked by permissions/capabilities: {err}"),
+                        reason: format!("AF_XDP probe blocked by permissions/capabilities: {err}"),
                         packets_sent: 0,
                         packets_received: 0,
                         attempts: 0,
@@ -131,7 +133,7 @@ pub fn run(snapshot: &HostSnapshot, config: &E2eConfig) -> E2eReport {
             results.push(E2eInterfaceResult {
                 interface: iface.name.clone(),
                 status: E2eStatus::Fail,
-                reason,
+                reason: format!("AF_XDP probe failed: {reason}"),
                 packets_sent: 0,
                 packets_received: 0,
                 attempts,

@@ -173,7 +173,7 @@ fn run_e2e(args: E2eArgs) {
 }
 
 fn print_e2e_text_report(report: &E2eReport, verbose: bool) {
-    println!("xdp-system-compat e2e");
+    println!("xdp-system-compat e2e (AF_XDP probe)");
     println!(
         "  interfaces tested: {} ({} passed, {} failed, {} skipped)",
         report.summary.tested, report.summary.passed, report.summary.failed, report.summary.skipped
@@ -184,7 +184,7 @@ fn print_e2e_text_report(report: &E2eReport, verbose: bool) {
         return;
     }
 
-    println!("\nE2E Results:");
+    println!("\nAF_XDP Probe Results:");
     for result in &report.results {
         if !verbose && matches!(result.status, E2eStatus::Skip) {
             continue;
