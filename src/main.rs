@@ -113,8 +113,8 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
 
     if let ProbeResult::Ok { value: cpu } = &report.host.operator_context.cpu_topology {
         println!("  cpu: {} logical cores online", cpu.logical_core_count);
+        println!("  cpu online indexes: {}", format_index_ranges(&cpu.online_cores));
         if *output_level == OutputLevel::Extended {
-            println!("  cpu online list: {:?}", cpu.online_cores);
             println!("  smt sibling sets: {:?}", cpu.smt_sibling_sets);
             for core in &cpu.core_to_numa {
                 println!(
@@ -323,6 +323,42 @@ fn format_hugepages_value(label: &str, value: &ProbeResult<u64>) -> String {
             format!("{label}: unknown")
         }
     }
+}
+
+fn format_index_ranges(values: &[usize]) -> String {
+    if values.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+
+    let mut parts = Vec::new();
+    let mut start = sorted[0];
+    let mut prev = sorted[0];
+
+    for &v in sorted.iter().skip(1) {
+        if v == prev + 1 {
+            prev = v;
+            continue;
+        }
+        if start == prev {
+            parts.push(start.to_string());
+        } else {
+            parts.push(format!("{start}-{prev}"));
+        }
+        start = v;
+        prev = v;
+    }
+
+    if start == prev {
+        parts.push(start.to_string());
+    } else {
+        parts.push(format!("{start}-{prev}"));
+    }
+
+    parts.join(",")
 }
 
 fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
