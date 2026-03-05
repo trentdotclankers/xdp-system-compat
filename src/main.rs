@@ -146,11 +146,12 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
 
     match &report.host.interfaces {
         ProbeResult::Ok { value: ifaces } => {
-            println!(
-                "  interfaces: {} shown ({} discovered)",
-                visible_ifaces.len(),
-                ifaces.len()
-            );
+            let hidden = ifaces.len().saturating_sub(visible_ifaces.len());
+            if hidden == 0 {
+                println!("  interfaces: {} discovered", ifaces.len());
+            } else {
+                println!("  interfaces: {} discovered ({} hidden)", ifaces.len(), hidden);
+            }
             for iface in &visible_ifaces {
                 if *output_level == OutputLevel::Basic {
                     println!(
