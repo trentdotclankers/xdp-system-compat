@@ -1,4 +1,4 @@
-use crate::model::{CapabilityState, HostSnapshot, InterfaceInfo};
+use crate::model::{CapabilityState, HostSnapshot, InterfaceInfo, ProbeResult};
 use std::{
     ffi::CString,
     fs, io, mem,
@@ -12,16 +12,24 @@ const CAP_PERFMON_BIT: u32 = 38;
 const CAP_BPF_BIT: u32 = 39;
 
 pub fn collect_snapshot() -> HostSnapshot {
+    // Phase A: always-safe probes.
     let os = std::env::consts::OS.to_string();
     let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .map(|s| s.trim().to_string());
-    let af_xdp_supported = af_xdp_supported();
-    let interfaces = probe_interfaces();
-    let default_route_interface = default_route_interface();
-    let capabilities_permitted = probe_capabilities();
-    let memlock_bytes = parse_memlock_limit();
     let page_size_bytes = page_size();
+    let memlock_bytes = parse_memlock_limit();
+
+    // Phase C: passive sysfs/proc reads.
+    let mut interfaces = probe_interfaces();
+    let default_route_interface = default_route_interface();
+
+    // Phase B: capability context.
+    let capabilities_permitted = probe_capabilities();
+
+    // Phase D: active probes gated by capability context.
+    let af_xdp_supported = af_xdp_supported(&os, capabilities_permitted.as_ref());
+    probe_interface_ipv4(&mut interfaces);
 
     HostSnapshot {
         os,
@@ -35,33 +43,71 @@ pub fn collect_snapshot() -> HostSnapshot {
     }
 }
 
-fn af_xdp_supported() -> bool {
+fn af_xdp_supported(os: &str, capabilities: ProbeResult<&CapabilityState>) -> ProbeResult<bool> {
+    if os != "linux" {
+        return ProbeResult::Unavailable {
+            reason: "AF_XDP probing is only implemented on Linux".to_string(),
+        };
+    }
+
+    let caps = match capabilities {
+        ProbeResult::Ok { value } => value,
+        ProbeResult::Blocked { reason }
+        | ProbeResult::Failed { reason }
+        | ProbeResult::Unavailable { reason } => {
+            return ProbeResult::Blocked {
+                reason: format!("capability context unavailable: {reason}"),
+            };
+        }
+    };
+
+    if !caps.cap_net_raw {
+        return ProbeResult::Blocked {
+            reason: "CAP_NET_RAW is not permitted; AF_XDP socket probe skipped".to_string(),
+        };
+    }
+
     #[cfg(target_os = "linux")]
     {
         // Safety: direct libc socket call.
         let fd = unsafe { libc::socket(libc::AF_XDP, libc::SOCK_RAW, 0) };
         if fd < 0 {
-            return false;
+            let err = io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+                return ProbeResult::Blocked {
+                    reason: format!("AF_XDP probe blocked by permissions: {err}"),
+                };
+            }
+            return ProbeResult::Failed {
+                reason: format!("AF_XDP socket creation failed: {err}"),
+            };
         }
+
         // Safety: fd was just returned by socket and is valid.
         let _owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        true
+        ProbeResult::ok(true)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        false
+        ProbeResult::Unavailable {
+            reason: "AF_XDP probing is only implemented on Linux".to_string(),
+        }
     }
 }
 
-fn probe_interfaces() -> Vec<InterfaceInfo> {
+fn probe_interfaces() -> ProbeResult<Vec<InterfaceInfo>> {
     let net_dir = Path::new("/sys/class/net");
-    let mut interfaces = Vec::new();
-
     let entries = match fs::read_dir(net_dir) {
         Ok(entries) => entries,
-        Err(_) => return interfaces,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /sys/class/net: {err}"),
+            };
+        }
     };
+
+    let mut interfaces = Vec::new();
 
     for entry in entries.flatten() {
         let iface = entry.file_name().to_string_lossy().to_string();
@@ -69,19 +115,20 @@ fn probe_interfaces() -> Vec<InterfaceInfo> {
         let has_device = base.join("device").exists();
         let is_bond = base.join("bonding").exists();
         let tx_queues = count_tx_queues(&base);
-        let has_ipv4 = iface_has_ipv4(&iface);
 
         interfaces.push(InterfaceInfo {
             name: iface,
             has_device,
             is_bond,
             tx_queues,
-            has_ipv4,
+            has_ipv4: ProbeResult::Unavailable {
+                reason: "IPv4 probe not executed yet".to_string(),
+            },
         });
     }
 
     interfaces.sort_by(|a, b| a.name.cmp(&b.name));
-    interfaces
+    ProbeResult::ok(interfaces)
 }
 
 fn count_tx_queues(base: &Path) -> usize {
@@ -98,8 +145,16 @@ fn count_tx_queues(base: &Path) -> usize {
         .count()
 }
 
-fn default_route_interface() -> Option<String> {
-    let route = fs::read_to_string("/proc/net/route").ok()?;
+fn default_route_interface() -> ProbeResult<Option<String>> {
+    let route = match fs::read_to_string("/proc/net/route") {
+        Ok(route) => route,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /proc/net/route: {err}"),
+            };
+        }
+    };
+
     for line in route.lines().skip(1) {
         let cols = line.split_whitespace().collect::<Vec<_>>();
         if cols.len() < 3 {
@@ -108,32 +163,54 @@ fn default_route_interface() -> Option<String> {
         let iface = cols[0];
         let destination = cols[1];
         if destination == "00000000" {
-            return Some(iface.to_string());
+            return ProbeResult::ok(Some(iface.to_string()));
         }
     }
-    None
+    ProbeResult::ok(None)
 }
 
-fn probe_capabilities() -> CapabilityState {
-    let mut cap_prm = 0u64;
+fn probe_capabilities() -> ProbeResult<CapabilityState> {
+    let status = match fs::read_to_string("/proc/self/status") {
+        Ok(status) => status,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /proc/self/status: {err}"),
+            };
+        }
+    };
 
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if let Some(hex) = line.strip_prefix("CapPrm:\t") {
-                if let Ok(bits) = u64::from_str_radix(hex.trim(), 16) {
-                    cap_prm = bits;
+    let mut cap_prm = None;
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapPrm:\t") {
+            match u64::from_str_radix(hex.trim(), 16) {
+                Ok(bits) => {
+                    cap_prm = Some(bits);
+                    break;
                 }
-                break;
+                Err(err) => {
+                    return ProbeResult::Failed {
+                        reason: format!("failed to parse CapPrm value '{hex}': {err}"),
+                    };
+                }
             }
         }
     }
 
-    CapabilityState {
+    let cap_prm = match cap_prm {
+        Some(bits) => bits,
+        None => {
+            return ProbeResult::Unavailable {
+                reason: "CapPrm field missing in /proc/self/status".to_string(),
+            };
+        }
+    };
+
+    ProbeResult::ok(CapabilityState {
         cap_net_admin: bit_set(cap_prm, CAP_NET_ADMIN_BIT),
         cap_net_raw: bit_set(cap_prm, CAP_NET_RAW_BIT),
         cap_bpf: bit_set(cap_prm, CAP_BPF_BIT),
         cap_perfmon: bit_set(cap_prm, CAP_PERFMON_BIT),
-    }
+    })
 }
 
 fn bit_set(mask: u64, bit: u32) -> bool {
@@ -143,8 +220,15 @@ fn bit_set(mask: u64, bit: u32) -> bool {
     (mask & (1u64 << bit)) != 0
 }
 
-fn parse_memlock_limit() -> Option<u64> {
-    let limits = fs::read_to_string("/proc/self/limits").ok()?;
+fn parse_memlock_limit() -> ProbeResult<u64> {
+    let limits = match fs::read_to_string("/proc/self/limits") {
+        Ok(limits) => limits,
+        Err(err) => {
+            return ProbeResult::Failed {
+                reason: format!("failed to read /proc/self/limits: {err}"),
+            };
+        }
+    };
 
     for line in limits.lines() {
         if !line.starts_with("Max locked memory") {
@@ -153,19 +237,27 @@ fn parse_memlock_limit() -> Option<u64> {
 
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() < 4 {
-            return None;
+            return ProbeResult::Failed {
+                reason: "unexpected Max locked memory line format".to_string(),
+            };
         }
 
-        // format: Max locked memory  8388608  8388608  bytes
         let soft = fields[3];
         if soft.eq_ignore_ascii_case("unlimited") {
-            return Some(u64::MAX);
+            return ProbeResult::ok(u64::MAX);
         }
 
-        return soft.parse::<u64>().ok();
+        return match soft.parse::<u64>() {
+            Ok(value) => ProbeResult::ok(value),
+            Err(err) => ProbeResult::Failed {
+                reason: format!("failed to parse memlock value '{soft}': {err}"),
+            },
+        };
     }
 
-    None
+    ProbeResult::Unavailable {
+        reason: "Max locked memory line not found in /proc/self/limits".to_string(),
+    }
 }
 
 fn page_size() -> u64 {
@@ -174,28 +266,54 @@ fn page_size() -> u64 {
     if size <= 0 { 4096 } else { size as u64 }
 }
 
-fn iface_has_ipv4(iface: &str) -> bool {
+fn probe_interface_ipv4(interfaces: &mut ProbeResult<Vec<InterfaceInfo>>) {
+    let ProbeResult::Ok { value: interfaces } = interfaces else {
+        return;
+    };
+
+    for iface in interfaces {
+        iface.has_ipv4 = iface_has_ipv4(&iface.name);
+    }
+}
+
+fn iface_has_ipv4(iface: &str) -> ProbeResult<bool> {
     #[cfg(target_os = "linux")]
     {
-        iface_has_ipv4_linux(iface).unwrap_or(false)
+        iface_has_ipv4_linux(iface)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
         let _ = iface;
-        false
+        ProbeResult::Unavailable {
+            reason: "IPv4 ioctl probing is only implemented on Linux".to_string(),
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn iface_has_ipv4_linux(iface: &str) -> io::Result<bool> {
-    let ifname = CString::new(iface)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid iface"))?;
+fn iface_has_ipv4_linux(iface: &str) -> ProbeResult<bool> {
+    let ifname = match CString::new(iface) {
+        Ok(ifname) => ifname,
+        Err(_) => {
+            return ProbeResult::Failed {
+                reason: "interface name is not a valid C string".to_string(),
+            };
+        }
+    };
 
     // Safety: direct libc socket call.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            return ProbeResult::Blocked {
+                reason: format!("IPv4 probe socket blocked by permissions: {err}"),
+            };
+        }
+        return ProbeResult::Failed {
+            reason: format!("failed to create IPv4 probe socket: {err}"),
+        };
     }
     // Safety: fd is valid.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -217,15 +335,21 @@ fn iface_has_ipv4_linux(iface: &str) -> io::Result<bool> {
     let res = unsafe { libc::ioctl(owned.as_raw_fd(), libc::SIOCGIFADDR, &mut req) };
     if res < 0 {
         let err = io::Error::last_os_error();
-        return if err.kind() == io::ErrorKind::AddrNotAvailable
+        if err.kind() == io::ErrorKind::AddrNotAvailable
             || err.raw_os_error() == Some(libc::EADDRNOTAVAIL)
             || err.raw_os_error() == Some(libc::ENODEV)
         {
-            Ok(false)
-        } else {
-            Err(err)
+            return ProbeResult::ok(false);
+        }
+        if matches!(err.raw_os_error(), Some(libc::EPERM | libc::EACCES)) {
+            return ProbeResult::Blocked {
+                reason: format!("IPv4 ioctl blocked by permissions: {err}"),
+            };
+        }
+        return ProbeResult::Failed {
+            reason: format!("IPv4 ioctl probe failed: {err}"),
         };
     }
 
-    Ok(true)
+    ProbeResult::ok(true)
 }

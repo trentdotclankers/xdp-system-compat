@@ -1,4 +1,4 @@
-use crate::model::{Finding, HostSnapshot, Severity};
+use crate::model::{Finding, HostSnapshot, InterfaceInfo, ProbeResult, Severity};
 
 const CAP_NET_ADMIN: &str = "CAP_NET_ADMIN";
 const CAP_NET_RAW: &str = "CAP_NET_RAW";
@@ -26,18 +26,208 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
         return findings;
     }
 
-    if !snapshot.af_xdp_supported {
-        findings.push(Finding {
-            id: "XDP002",
-            severity: Severity::Error,
-            title: "AF_XDP socket support is unavailable",
-            details: "Creating an AF_XDP socket failed on this host, so XDP retransmit cannot be initialized.".to_string(),
-            remediation: "Use a kernel/NIC stack with AF_XDP support enabled; verify kernel config and driver support.".to_string(),
-        });
+    match &snapshot.af_xdp_supported {
+        ProbeResult::Ok { value } => {
+            if !value {
+                findings.push(Finding {
+                    id: "XDP002",
+                    severity: Severity::Error,
+                    title: "AF_XDP socket support is unavailable",
+                    details: "AF_XDP probe returned unsupported on this host.".to_string(),
+                    remediation: "Use a kernel/NIC stack with AF_XDP support enabled; verify kernel config and driver support.".to_string(),
+                });
+            }
+        }
+        ProbeResult::Failed { reason } => {
+            findings.push(Finding {
+                id: "XDP002",
+                severity: Severity::Error,
+                title: "AF_XDP socket support is unavailable",
+                details: format!(
+                    "AF_XDP socket probing failed, so XDP retransmit cannot be initialized: {reason}"
+                ),
+                remediation: "Use a kernel/NIC stack with AF_XDP support enabled; verify kernel config and driver support.".to_string(),
+            });
+        }
+        ProbeResult::Blocked { reason } => {
+            findings.push(Finding {
+                id: "XDP012",
+                severity: Severity::Warn,
+                title: "AF_XDP compatibility probe was blocked",
+                details: format!(
+                    "The tool could not validate AF_XDP support because probing was blocked: {reason}"
+                ),
+                remediation:
+                    "Run the tool with sufficient privileges/capabilities to validate AF_XDP support conclusively."
+                        .to_string(),
+            });
+        }
+        ProbeResult::Unavailable { reason } => {
+            findings.push(Finding {
+                id: "XDP012",
+                severity: Severity::Warn,
+                title: "AF_XDP compatibility probe was unavailable",
+                details: format!(
+                    "The tool could not validate AF_XDP support in this environment: {reason}"
+                ),
+                remediation: "Run the tool in a Linux environment with AF_XDP probing support."
+                    .to_string(),
+            });
+        }
     }
 
-    let physical_ifaces = snapshot
-        .interfaces
+    let mut interfaces = None;
+    match &snapshot.interfaces {
+        ProbeResult::Ok { value } => interfaces = Some(value),
+        ProbeResult::Blocked { reason }
+        | ProbeResult::Failed { reason }
+        | ProbeResult::Unavailable { reason } => {
+            findings.push(Finding {
+                id: "XDP013",
+                severity: Severity::Warn,
+                title: "Network interface inventory probe was inconclusive",
+                details: format!("Could not enumerate interfaces reliably: {reason}"),
+                remediation: "Ensure /sys/class/net is readable from the tool runtime context."
+                    .to_string(),
+            });
+        }
+    }
+
+    if let Some(interfaces) = interfaces {
+        validate_interfaces(interfaces, &mut findings);
+    }
+
+    match &snapshot.default_route_interface {
+        ProbeResult::Ok { value } => match value {
+            None => findings.push(Finding {
+                id: "XDP004",
+                severity: Severity::Warn,
+                title: "No default route interface detected",
+                details:
+                    "Unable to identify the default route interface from /proc/net/route."
+                        .to_string(),
+                remediation: "If relying on implicit XDP interface selection, configure a default route or set an explicit XDP interface at validator startup.".to_string(),
+            }),
+            Some(default_iface) => {
+                if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
+                    if let Some(iface) = interfaces.iter().find(|i| i.name == *default_iface) {
+                        if !iface.has_device || iface.is_bond {
+                            findings.push(Finding {
+                                id: "XDP005",
+                                severity: Severity::Warn,
+                                title: "Default route interface may be incompatible with zero-copy XDP",
+                                details: format!(
+                                    "Default route interface '{}' is {}{}.",
+                                    iface.name,
+                                    if iface.is_bond { "bonded" } else { "non-physical" },
+                                    if iface.is_bond { " (bond master)" } else { "" }
+                                ),
+                                remediation: "When using XDP zero-copy, select a real physical interface explicitly instead of a bond/virtual interface.".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        },
+        ProbeResult::Blocked { reason }
+        | ProbeResult::Failed { reason }
+        | ProbeResult::Unavailable { reason } => {
+            findings.push(Finding {
+                id: "XDP014",
+                severity: Severity::Warn,
+                title: "Default route probe was inconclusive",
+                details: format!("Could not read default route information: {reason}"),
+                remediation: "Ensure /proc/net/route is readable from the tool runtime context."
+                    .to_string(),
+            });
+        }
+    }
+
+    match &snapshot.capabilities_permitted {
+        ProbeResult::Ok { value: caps } => {
+            if !caps.cap_net_admin || !caps.cap_net_raw {
+                let mut missing = Vec::new();
+                if !caps.cap_net_admin {
+                    missing.push(CAP_NET_ADMIN);
+                }
+                if !caps.cap_net_raw {
+                    missing.push(CAP_NET_RAW);
+                }
+                findings.push(Finding {
+                    id: "XDP007",
+                    severity: Severity::Warn,
+                    title: "Required Linux capabilities for XDP setup are not currently permitted",
+                    details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
+                    remediation: "Permit CAP_NET_ADMIN and CAP_NET_RAW for the validator process before enabling XDP retransmit.".to_string(),
+                });
+            }
+
+            if !caps.cap_bpf || !caps.cap_perfmon {
+                let mut missing = Vec::new();
+                if !caps.cap_bpf {
+                    missing.push(CAP_BPF);
+                }
+                if !caps.cap_perfmon {
+                    missing.push(CAP_PERFMON);
+                }
+                findings.push(Finding {
+                    id: "XDP008",
+                    severity: Severity::Warn,
+                    title: "Capabilities for XDP zero-copy/eBPF attachment are missing",
+                    details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
+                    remediation: "If planning to enable XDP zero-copy, permit CAP_BPF and CAP_PERFMON for the validator process.".to_string(),
+                });
+            }
+        }
+        ProbeResult::Blocked { reason }
+        | ProbeResult::Failed { reason }
+        | ProbeResult::Unavailable { reason } => {
+            findings.push(Finding {
+                id: "XDP015",
+                severity: Severity::Warn,
+                title: "Capability inventory probe was inconclusive",
+                details: format!("Could not determine process capability set: {reason}"),
+                remediation:
+                    "Ensure /proc/self/status is readable so capability constraints can be assessed."
+                        .to_string(),
+            });
+        }
+    }
+
+    match &snapshot.memlock_bytes {
+        ProbeResult::Ok { value: memlock } => {
+            if *memlock < ESTIMATED_MEMLOCK_PER_QUEUE_BYTES {
+                findings.push(Finding {
+                    id: "XDP010",
+                    severity: Severity::Warn,
+                    title: "Current memlock limit is likely too low for XDP UMEM",
+                    details: format!(
+                        "memlock={} bytes; estimated minimum per XDP queue is ~{} bytes.",
+                        memlock, ESTIMATED_MEMLOCK_PER_QUEUE_BYTES
+                    ),
+                    remediation: "Increase process memlock limits (for example via systemd LimitMEMLOCK) before enabling XDP retransmit.".to_string(),
+                });
+            }
+        }
+        ProbeResult::Blocked { reason }
+        | ProbeResult::Failed { reason }
+        | ProbeResult::Unavailable { reason } => {
+            findings.push(Finding {
+                id: "XDP011",
+                severity: Severity::Warn,
+                title: "Unable to verify memlock limit",
+                details: format!("Memlock probe was inconclusive: {reason}"),
+                remediation: "Verify memlock limits manually; low limits can prevent XDP startup."
+                    .to_string(),
+            });
+        }
+    }
+
+    findings
+}
+
+fn validate_interfaces(interfaces: &[InterfaceInfo], findings: &mut Vec<Finding>) {
+    let physical_ifaces = interfaces
         .iter()
         .filter(|iface| iface.has_device)
         .collect::<Vec<_>>();
@@ -54,36 +244,7 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
         });
     }
 
-    if snapshot.default_route_interface.is_none() {
-        findings.push(Finding {
-            id: "XDP004",
-            severity: Severity::Warn,
-            title: "No default route interface detected",
-            details: "Unable to identify the default route interface from /proc/net/route.".to_string(),
-            remediation: "If relying on implicit XDP interface selection, configure a default route or set an explicit XDP interface at validator startup.".to_string(),
-        });
-    }
-
-    if let Some(default_iface) = snapshot.default_route_interface.as_deref() {
-        if let Some(iface) = snapshot.interfaces.iter().find(|i| i.name == default_iface) {
-            if !iface.has_device || iface.is_bond {
-                findings.push(Finding {
-                    id: "XDP005",
-                    severity: Severity::Warn,
-                    title: "Default route interface may be incompatible with zero-copy XDP",
-                    details: format!(
-                        "Default route interface '{}' is {}{}.",
-                        iface.name,
-                        if iface.is_bond { "bonded" } else { "non-physical" },
-                        if iface.is_bond { " (bond master)" } else { "" }
-                    ),
-                    remediation: "When using XDP zero-copy, select a real physical interface explicitly instead of a bond/virtual interface.".to_string(),
-                });
-            }
-        }
-    }
-
-    for iface in &snapshot.interfaces {
+    for iface in interfaces {
         if iface.has_device && iface.tx_queues == 0 {
             findings.push(Finding {
                 id: "XDP006",
@@ -98,82 +259,46 @@ pub fn evaluate(snapshot: &HostSnapshot) -> Vec<Finding> {
         }
     }
 
-    if !snapshot.capabilities_permitted.cap_net_admin
-        || !snapshot.capabilities_permitted.cap_net_raw
-    {
-        let mut missing = Vec::new();
-        if !snapshot.capabilities_permitted.cap_net_admin {
-            missing.push(CAP_NET_ADMIN);
+    let mut has_known_ipv4 = false;
+    let mut ipv4_probe_unknown = false;
+    for iface in interfaces {
+        match &iface.has_ipv4 {
+            ProbeResult::Ok { value } => {
+                if *value {
+                    has_known_ipv4 = true;
+                }
+            }
+            ProbeResult::Blocked { .. }
+            | ProbeResult::Failed { .. }
+            | ProbeResult::Unavailable { .. } => ipv4_probe_unknown = true,
         }
-        if !snapshot.capabilities_permitted.cap_net_raw {
-            missing.push(CAP_NET_RAW);
-        }
-        findings.push(Finding {
-            id: "XDP007",
-            severity: Severity::Warn,
-            title: "Required Linux capabilities for XDP setup are not currently permitted",
-            details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
-            remediation: "Permit CAP_NET_ADMIN and CAP_NET_RAW for the validator process before enabling XDP retransmit.".to_string(),
-        });
     }
 
-    if !snapshot.capabilities_permitted.cap_bpf || !snapshot.capabilities_permitted.cap_perfmon {
-        let mut missing = Vec::new();
-        if !snapshot.capabilities_permitted.cap_bpf {
-            missing.push(CAP_BPF);
-        }
-        if !snapshot.capabilities_permitted.cap_perfmon {
-            missing.push(CAP_PERFMON);
-        }
-        findings.push(Finding {
-            id: "XDP008",
-            severity: Severity::Warn,
-            title: "Capabilities for XDP zero-copy/eBPF attachment are missing",
-            details: format!("Missing permitted capabilities: {}.", missing.join(", ")),
-            remediation: "If planning to enable XDP zero-copy, permit CAP_BPF and CAP_PERFMON for the validator process.".to_string(),
-        });
-    }
-
-    if !snapshot.interfaces.iter().any(|iface| iface.has_ipv4) {
-        findings.push(Finding {
-            id: "XDP009",
-            severity: Severity::Warn,
-            title: "No interface with IPv4 address detected",
-            details: "XDP transmit source-IP inference requires a usable IPv4 address.".to_string(),
-            remediation: "Ensure at least one candidate retransmit interface has IPv4 configured, or provide explicit networking that resolves source IP correctly.".to_string(),
-        });
-    }
-
-    if let Some(memlock) = snapshot.memlock_bytes {
-        if memlock < ESTIMATED_MEMLOCK_PER_QUEUE_BYTES {
+    if !has_known_ipv4 {
+        if ipv4_probe_unknown {
             findings.push(Finding {
-                id: "XDP010",
+                id: "XDP016",
                 severity: Severity::Warn,
-                title: "Current memlock limit is likely too low for XDP UMEM",
-                details: format!(
-                    "memlock={} bytes; estimated minimum per XDP queue is ~{} bytes.",
-                    memlock, ESTIMATED_MEMLOCK_PER_QUEUE_BYTES
-                ),
-                remediation: "Increase process memlock limits (for example via systemd LimitMEMLOCK) before enabling XDP retransmit.".to_string(),
+                title: "Interface IPv4 probe was inconclusive",
+                details: "No interface was confirmed with IPv4, but at least one IPv4 probe could not be completed.".to_string(),
+                remediation: "Run the tool with sufficient permissions and verify IPv4 assignment on candidate retransmit interfaces.".to_string(),
+            });
+        } else {
+            findings.push(Finding {
+                id: "XDP009",
+                severity: Severity::Warn,
+                title: "No interface with IPv4 address detected",
+                details: "XDP transmit source-IP inference requires a usable IPv4 address."
+                    .to_string(),
+                remediation: "Ensure at least one candidate retransmit interface has IPv4 configured, or provide explicit networking that resolves source IP correctly.".to_string(),
             });
         }
-    } else {
-        findings.push(Finding {
-            id: "XDP011",
-            severity: Severity::Warn,
-            title: "Unable to read memlock limit",
-            details: "Could not parse /proc/self/limits for Max locked memory.".to_string(),
-            remediation: "Verify memlock limits manually; low limits can prevent XDP startup."
-                .to_string(),
-        });
     }
-
-    findings
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{CapabilityState, HostSnapshot, InterfaceInfo, Severity};
+    use crate::model::{CapabilityState, HostSnapshot, InterfaceInfo, ProbeResult, Severity};
 
     use super::evaluate;
 
@@ -181,22 +306,22 @@ mod tests {
         HostSnapshot {
             os: "linux".to_string(),
             kernel_release: Some("6.6.0".to_string()),
-            af_xdp_supported: true,
-            interfaces: vec![InterfaceInfo {
+            af_xdp_supported: ProbeResult::ok(true),
+            interfaces: ProbeResult::ok(vec![InterfaceInfo {
                 name: "eth0".to_string(),
                 has_device: true,
                 is_bond: false,
                 tx_queues: 8,
-                has_ipv4: true,
-            }],
-            default_route_interface: Some("eth0".to_string()),
-            capabilities_permitted: CapabilityState {
+                has_ipv4: ProbeResult::ok(true),
+            }]),
+            default_route_interface: ProbeResult::ok(Some("eth0".to_string())),
+            capabilities_permitted: ProbeResult::ok(CapabilityState {
                 cap_net_admin: true,
                 cap_net_raw: true,
                 cap_bpf: true,
                 cap_perfmon: true,
-            },
-            memlock_bytes: Some(2_000_000_000),
+            }),
+            memlock_bytes: ProbeResult::ok(2_000_000_000),
             page_size_bytes: 4096,
         }
     }
@@ -220,8 +345,12 @@ mod tests {
     #[test]
     fn capability_gaps_reported() {
         let mut snapshot = linux_snapshot();
-        snapshot.capabilities_permitted.cap_net_admin = false;
-        snapshot.capabilities_permitted.cap_perfmon = false;
+        snapshot.capabilities_permitted = ProbeResult::ok(CapabilityState {
+            cap_net_admin: false,
+            cap_net_raw: true,
+            cap_bpf: true,
+            cap_perfmon: false,
+        });
         let findings = evaluate(&snapshot);
         let ids = findings.iter().map(|f| f.id).collect::<Vec<_>>();
         assert!(ids.contains(&"XDP007"));
@@ -231,8 +360,19 @@ mod tests {
     #[test]
     fn low_memlock_reported() {
         let mut snapshot = linux_snapshot();
-        snapshot.memlock_bytes = Some(1_000_000);
+        snapshot.memlock_bytes = ProbeResult::ok(1_000_000);
         let findings = evaluate(&snapshot);
         assert!(findings.iter().any(|f| f.id == "XDP010"));
+    }
+
+    #[test]
+    fn blocked_af_xdp_probe_is_not_error() {
+        let mut snapshot = linux_snapshot();
+        snapshot.af_xdp_supported = ProbeResult::Blocked {
+            reason: "missing CAP_NET_RAW".to_string(),
+        };
+        let findings = evaluate(&snapshot);
+        assert!(findings.iter().any(|f| f.id == "XDP012"));
+        assert!(!findings.iter().any(|f| f.id == "XDP002"));
     }
 }

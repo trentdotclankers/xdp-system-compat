@@ -1,6 +1,6 @@
 use clap::Parser;
 use xdp_system_compat::{
-    model::{Report, Severity, Summary},
+    model::{HostSnapshot, ProbeResult, Report, Severity, Summary},
     probe, rules,
 };
 
@@ -31,9 +31,16 @@ fn main() {
         .iter()
         .filter(|f| matches!(f.severity, Severity::Warn))
         .count();
+    let (blocked_probes, failed_probes, unavailable_probes) = count_probe_states(&snapshot);
 
     let report = Report {
-        summary: Summary { errors, warnings },
+        summary: Summary {
+            errors,
+            warnings,
+            blocked_probes,
+            failed_probes,
+            unavailable_probes,
+        },
         host: snapshot,
         findings,
     };
@@ -64,8 +71,12 @@ fn print_text_report(report: &Report) {
         println!("  kernel: {release}");
     }
     println!(
-        "  findings: {} error(s), {} warning(s)",
-        report.summary.errors, report.summary.warnings
+        "  findings: {} error(s), {} warning(s); probes: {} blocked, {} failed, {} unavailable",
+        report.summary.errors,
+        report.summary.warnings,
+        report.summary.blocked_probes,
+        report.summary.failed_probes,
+        report.summary.unavailable_probes
     );
 
     if report.findings.is_empty() {
@@ -82,5 +93,64 @@ fn print_text_report(report: &Report) {
         println!("- [{}] {} {}", f.id, severity, f.title);
         println!("  details: {}", f.details);
         println!("  remediation: {}", f.remediation);
+    }
+}
+
+fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
+    let mut blocked = 0usize;
+    let mut failed = 0usize;
+    let mut unavailable = 0usize;
+
+    accumulate_probe_state(
+        &snapshot.af_xdp_supported,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.interfaces,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.default_route_interface,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.capabilities_permitted,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+    accumulate_probe_state(
+        &snapshot.memlock_bytes,
+        &mut blocked,
+        &mut failed,
+        &mut unavailable,
+    );
+
+    if let ProbeResult::Ok { value: interfaces } = &snapshot.interfaces {
+        for iface in interfaces {
+            accumulate_probe_state(&iface.has_ipv4, &mut blocked, &mut failed, &mut unavailable);
+        }
+    }
+
+    (blocked, failed, unavailable)
+}
+
+fn accumulate_probe_state<T>(
+    probe: &ProbeResult<T>,
+    blocked: &mut usize,
+    failed: &mut usize,
+    unavailable: &mut usize,
+) {
+    match probe {
+        ProbeResult::Ok { .. } => {}
+        ProbeResult::Blocked { .. } => *blocked += 1,
+        ProbeResult::Failed { .. } => *failed += 1,
+        ProbeResult::Unavailable { .. } => *unavailable += 1,
     }
 }

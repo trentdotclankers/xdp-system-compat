@@ -17,12 +17,42 @@ pub struct Finding {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProbeResult<T> {
+    Ok { value: T },
+    Blocked { reason: String },
+    Failed { reason: String },
+    Unavailable { reason: String },
+}
+
+impl<T> ProbeResult<T> {
+    pub fn ok(value: T) -> Self {
+        Self::Ok { value }
+    }
+
+    pub fn as_ref(&self) -> ProbeResult<&T> {
+        match self {
+            Self::Ok { value } => ProbeResult::Ok { value },
+            Self::Blocked { reason } => ProbeResult::Blocked {
+                reason: reason.clone(),
+            },
+            Self::Failed { reason } => ProbeResult::Failed {
+                reason: reason.clone(),
+            },
+            Self::Unavailable { reason } => ProbeResult::Unavailable {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InterfaceInfo {
     pub name: String,
     pub has_device: bool,
     pub is_bond: bool,
     pub tx_queues: usize,
-    pub has_ipv4: bool,
+    pub has_ipv4: ProbeResult<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,11 +67,11 @@ pub struct CapabilityState {
 pub struct HostSnapshot {
     pub os: String,
     pub kernel_release: Option<String>,
-    pub af_xdp_supported: bool,
-    pub interfaces: Vec<InterfaceInfo>,
-    pub default_route_interface: Option<String>,
-    pub capabilities_permitted: CapabilityState,
-    pub memlock_bytes: Option<u64>,
+    pub af_xdp_supported: ProbeResult<bool>,
+    pub interfaces: ProbeResult<Vec<InterfaceInfo>>,
+    pub default_route_interface: ProbeResult<Option<String>>,
+    pub capabilities_permitted: ProbeResult<CapabilityState>,
+    pub memlock_bytes: ProbeResult<u64>,
     pub page_size_bytes: u64,
 }
 
@@ -56,4 +86,7 @@ pub struct Report {
 pub struct Summary {
     pub errors: usize,
     pub warnings: usize,
+    pub blocked_probes: usize,
+    pub failed_probes: usize,
+    pub unavailable_probes: usize,
 }
