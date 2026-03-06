@@ -383,18 +383,57 @@ fn print_operator_context(report: &Report, output_level: &OutputLevel, verbose: 
             .sum();
         println!("  irqs: {} mapped", total_irqs);
         if *output_level == OutputLevel::Extended {
-            for iface in iface_irqs {
-                if !visible_ifaces.iter().any(|v| v.name == iface.interface) {
-                    continue;
-                }
-                println!("  irq map for {}:", iface.interface);
+            let visible_names: BTreeSet<&str> = visible_ifaces
+                .iter()
+                .map(|iface| iface.name.as_str())
+                .collect();
+            let visible_irq_ifaces = iface_irqs
+                .iter()
+                .filter(|iface| visible_names.contains(iface.interface.as_str()))
+                .collect::<Vec<_>>();
+            let with_irqs = visible_irq_ifaces
+                .iter()
+                .filter(|iface| !iface.irqs.is_empty())
+                .count();
+            let affinity_known = visible_irq_ifaces
+                .iter()
+                .flat_map(|iface| iface.irqs.iter())
+                .filter(|irq| probe_ok_value(&irq.smp_affinity_list).is_some())
+                .count();
+            println!(
+                "  irq details: interfaces_with_irqs={}/{} affinity_known={}/{}",
+                with_irqs,
+                visible_ifaces.len(),
+                affinity_known,
+                total_irqs
+            );
+            for iface in visible_irq_ifaces {
+                let mut unique_cpus = BTreeSet::new();
+                let mut parse_failures = 0usize;
+                let mut affinity_known_for_iface = 0usize;
                 for irq in &iface.irqs {
-                    println!(
-                        "    irq {} -> affinity {:?}",
-                        irq.irq,
-                        probe_ok_value(&irq.smp_affinity_list)
-                    );
+                    if let Some(list) = probe_ok_value(&irq.smp_affinity_list) {
+                        affinity_known_for_iface += 1;
+                        match parse_cpu_index_list(list) {
+                            Some(cpus) => {
+                                for cpu in cpus {
+                                    unique_cpus.insert(cpu);
+                                }
+                            }
+                            None => parse_failures += 1,
+                        }
+                    }
                 }
+                let unique_cpu_ranges =
+                    format_index_ranges(&unique_cpus.into_iter().collect::<Vec<_>>());
+                println!(
+                    "  - {}: irqs={} affinity_known={} unique_cpus={} affinity_parse_failures={}",
+                    iface.interface,
+                    iface.irqs.len(),
+                    affinity_known_for_iface,
+                    unique_cpu_ranges,
+                    parse_failures
+                );
             }
         }
     } else {
@@ -584,6 +623,29 @@ fn format_index_ranges(values: &[usize]) -> String {
     }
 
     parts.join(",")
+}
+
+fn parse_cpu_index_list(raw: &str) -> Option<Vec<usize>> {
+    let mut cpus = BTreeSet::new();
+    for part in raw.trim().split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = token.split_once('-') {
+            let start = start.trim().parse::<usize>().ok()?;
+            let end = end.trim().parse::<usize>().ok()?;
+            if start > end {
+                return None;
+            }
+            for cpu in start..=end {
+                cpus.insert(cpu);
+            }
+        } else {
+            cpus.insert(token.parse::<usize>().ok()?);
+        }
+    }
+    Some(cpus.into_iter().collect())
 }
 
 fn count_probe_states(snapshot: &HostSnapshot) -> (usize, usize, usize) {
